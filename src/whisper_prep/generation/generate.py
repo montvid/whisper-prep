@@ -81,7 +81,7 @@ def _generate(
     max_overlap_duration: float,
     vad_chance: float,
     keep_empty_chance: float,
-    audio_format: str = "mp3",
+    audio_format: str = "flac",
 ) -> None:
     offset = 0
     combined_audio = AudioSegment.empty()
@@ -179,7 +179,7 @@ def generate_fold(
     max_overlap_duration: float,
     vad_chance: float = 1.0,
     keep_empty_chance: float = 0.0,
-    audio_format: str = "mp3",
+    audio_format: str = "flac",
     n_jobs: int = 4,
     seed: int = 42,
 ) -> None:
