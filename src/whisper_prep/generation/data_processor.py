@@ -12,6 +12,7 @@ from typing import Deque, List, Optional, Union
 
 import torch
 import torchaudio
+import soundfile as _sf
 from tqdm import tqdm
 from whisper.audio import load_audio
 from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE, get_tokenizer
@@ -1150,7 +1151,7 @@ class DataProcessor:
     ) -> str:
         audio_start_idx = int(segment_start * SAMPLE_RATE / 1000)
         audio_end_idx = int(segment_end * SAMPLE_RATE / 1000)
-        segment_audio_path = str((dump_dir / f"{segment_start}.mp3").absolute())
+        segment_audio_path = str((dump_dir / f"{segment_start}.flac").absolute())
         segment_audio = audio[
             audio_start_idx : min(audio_end_idx, audio_start_idx + DURATION_IN_SAMPLES, audio.size(0))
         ]
@@ -1160,11 +1161,17 @@ class DataProcessor:
                 message="The 'encoding' parameter is not fully supported by TorchCodec AudioEncoder.",
                 category=UserWarning,
             )
-            torchaudio.save(
+            # Written with soundfile rather than torchaudio: the file is .flac, the
+            # old encoding="mp3" argument was a no-op, and torchaudio's TorchCodec
+            # backend ignores bits_per_sample and always emits PCM_24. LIEPA-3 ships
+            # FLAC PCM_16, so 24 bits stores no extra information while inflating the
+            # corpus by ~1/3.
+            _sf.write(
                 segment_audio_path,
-                segment_audio.unsqueeze(0),
+                segment_audio.detach().cpu().numpy(),
                 SAMPLE_RATE,
-                encoding="mp3",
+                format="FLAC",
+                subtype="PCM_16",
             )
         return segment_audio_path
 
