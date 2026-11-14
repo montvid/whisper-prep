@@ -1,15 +1,7 @@
-from datasets import load_dataset, DatasetDict, load_from_disk
+#!/usr/bin/env python3
+"""Compatibility wrapper; importing this module does not read or upload data."""
 
-# Load the dataset from the local directory
-ds_train = load_from_disk("/mnt/nas05/data01/vincenzo/spc_r/spc_r_whisper/train/hf")
-ds_test = load_from_disk("/mnt/nas05/data01/vincenzo/spc_r/spc_r_whisper/test/hf")
+from whisper_prep.push_to_hub import main
 
-print(ds_train)
-print(ds_test)
-# Name Train split to train split
-dataset = DatasetDict()
-dataset["train"] = ds_train["train"]
-dataset["test"] = ds_test["test"]
-
-
-dataset.push_to_hub("i4ds/spc_r_whisper")
+if __name__ == "__main__":
+    main()

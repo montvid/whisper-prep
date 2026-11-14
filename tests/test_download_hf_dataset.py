@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from whisper_prep import utils
+from whisper_prep.dataset import download as utils
 from whisper_prep.download_hf_dataset import main as download_main
 
 
@@ -32,13 +32,6 @@ def fake_audio():
 
 def patch_hf_dataset(monkeypatch, rows):
     monkeypatch.setattr(utils, "load_dataset", lambda name, split: FakeDataset(rows))
-    monkeypatch.setattr(
-        utils,
-        "concatenate_datasets",
-        lambda datasets: FakeDataset(
-            [row for dataset in datasets for row in dataset.rows]
-        ),
-    )
 
 
 def read_tsv(path: Path):
@@ -80,12 +73,12 @@ def test_save_hu_dataset_locally_writes_sentence_tsv(tmp_path, monkeypatch):
     rows = read_tsv(tmp_path / "hf_sentences.tsv")
     assert rows == [
         {
-            "path": "sample_1.wav",
+            "path": "0-0-sample_1.wav",
             "sentence": "Hallo Welt",
             "client_id": "speaker-1",
         }
     ]
-    assert (audio_dir / "sample_1.wav").exists()
+    assert (audio_dir / "0-0-sample_1.wav").exists()
     assert not (tmp_path / "transcripts_mapping.tsv").exists()
 
 
@@ -121,16 +114,16 @@ def test_save_hu_dataset_locally_writes_srt_mapping(tmp_path, monkeypatch):
 
     assert downloaded.sentence_tsvs == []
     assert downloaded.transcripts_tsv == str(tmp_path / "transcripts_mapping.tsv")
-    assert (audio_dir / "episode-1.wav").exists()
-    assert (transcript_dir / "episode-1.srt").read_text(encoding="utf-8") == srt_text
+    assert (audio_dir / "0-0-episode-1.wav").exists()
+    assert (transcript_dir / "0-0-episode-1.srt").read_text(encoding="utf-8") == srt_text
 
     rows = read_tsv(tmp_path / "transcripts_mapping.tsv")
     assert rows == [
         {
-            "srt_path": str(transcript_dir / "episode-1.srt"),
-            "audio_path": str(audio_dir / "episode-1.wav"),
+            "srt_path": str(transcript_dir / "0-0-episode-1.srt"),
+            "audio_path": str(audio_dir / "0-0-episode-1.wav"),
             "language": "de",
-            "id": "episode-1",
+            "id": "0-0-episode-1",
         }
     ]
 
@@ -140,13 +133,9 @@ def test_download_cli_passes_expected_config(tmp_path, monkeypatch, capsys):
 
     def fake_save(config, audio_dir, transcript_dir):
         calls.append((config, audio_dir, transcript_dir))
-        return utils.DownloadedDatasetPaths(
-            [str(config["out_folder"] / "hf_sentences.tsv")]
-        )
+        return utils.DownloadedDatasetPaths([str(config["out_folder"] / "hf_sentences.tsv")])
 
-    monkeypatch.setattr(
-        "whisper_prep.download_hf_dataset.save_hu_dataset_locally", fake_save
-    )
+    monkeypatch.setattr("whisper_prep.download_hf_dataset.save_hu_dataset_locally", fake_save)
     monkeypatch.setattr(
         sys,
         "argv",

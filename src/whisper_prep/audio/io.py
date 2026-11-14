@@ -19,7 +19,5 @@ def read_audio(
     return audio_segment
 
 
-def save_audio_segment(
-    audio_segment: AudioSegment, path: Union[str, Path], format: str
-) -> None:
+def save_audio_segment(audio_segment: AudioSegment, path: Union[str, Path], format: str) -> None:
     audio_segment.export(path, format=format)

@@ -1,52 +1,17 @@
-"""Tests for ensure_extracted and empty transcript segmentation."""
+"""Tests for empty transcript segmentation."""
 
 from __future__ import annotations
 
 import csv
 import shutil
 import struct
-import tarfile
 import tempfile
 import wave
 from pathlib import Path
 
-import pytest
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _make_metadata_csv(meta_dir: Path) -> None:
-    meta_dir.mkdir(parents=True, exist_ok=True)
-    with (meta_dir / "UrbanSound8K.csv").open("w", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "slice_file_name",
-                "fsID",
-                "start",
-                "end",
-                "salience",
-                "fold",
-                "classID",
-                "class",
-            ],
-            delimiter=",",
-        )
-        writer.writeheader()
-        writer.writerow(
-            dict(
-                slice_file_name="fake.wav",
-                fsID=1,
-                start=0.0,
-                end=2.0,
-                salience=1,
-                fold=1,
-                classID=0,
-                **{"class": "air_conditioner"},
-            )
-        )
 
 
 def _make_silent_wav(path: Path, dur_s: float = 2.0, sr: int = 16000) -> None:
@@ -57,25 +22,6 @@ def _make_silent_wav(path: Path, dur_s: float = 2.0, sr: int = 16000) -> None:
         wf.setsampwidth(2)
         wf.setframerate(sr)
         wf.writeframes(struct.pack(f"<{n}h", *([0] * n)))
-
-
-def _make_fake_archive(root: Path) -> Path:
-    """Create a minimal UrbanSound8K.tar.gz with metadata only."""
-    extracted = root / "UrbanSound8K"
-    meta_dir = extracted / "metadata"
-    _make_metadata_csv(meta_dir)
-
-    archive = root / "UrbanSound8K.tar.gz"
-    with tarfile.open(archive, "w:gz") as tar:
-        tar.add(extracted, arcname="UrbanSound8K")
-
-    shutil.rmtree(extracted)
-    return archive
-
-
-# ---------------------------------------------------------------------------
-# Tests: empty transcript segmentation (TSV path)
-# ---------------------------------------------------------------------------
 
 
 class TestEmptyTranscriptSegments:
@@ -90,6 +36,7 @@ class TestEmptyTranscriptSegments:
     def _run_dp(self, audio_path: Path, dur_s: float) -> list[dict]:
         """Run DataProcessor in TSV mode with one clip, return parsed records."""
         import json
+
         from whisper_prep.generation.data_processor import DataProcessor
 
         srt_path = self.tmp / f"{audio_path.stem}.srt"
@@ -147,7 +94,7 @@ class TestEmptyTranscriptSegments:
 
         assert len(records) == 1
         assert records[0]["audio_path"] != str(audio.absolute())
-        assert Path(records[0]["audio_path"]).exists()
+        assert (self.tmp / records[0]["audio_path"]).exists()
         assert records[0]["text"] == ""
 
     def test_long_empty_clip_is_split_into_dump_segments(self):
@@ -160,4 +107,4 @@ class TestEmptyTranscriptSegments:
         assert len(records) >= 2
         for r in records:
             assert r["audio_path"] != str(audio.absolute())
-            assert Path(r["audio_path"]).exists()
+            assert (self.tmp / r["audio_path"]).exists()

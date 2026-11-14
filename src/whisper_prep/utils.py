@@ -1,30 +1,29 @@
+from __future__ import annotations
+
 import argparse
-import csv
-import os
 import re
 import zlib
-from glob import glob
-from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import pysubs2
-from datasets import concatenate_datasets, load_dataset
-from fastlid import fastlid
-from tqdm.auto import tqdm
+from whisper_prep.text import TAG_RE, drop_text_fragments
+
+if TYPE_CHECKING:
+    import pysubs2
 
 NETFLIX_CHAR = 42
 NETFLIX_DUR = 7
 
 
-@dataclass
-class DownloadedDatasetPaths:
-    sentence_tsvs: list[str]
-    transcripts_tsv: str | None = None
+def fastlid(text):
+    from whisper_prep.language import identify_language as detect
+
+    return detect(text)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("-c", "--config", type=config_path)
+    parser.add_argument("-c", "--config", type=config_path, required=True)
     return parser.parse_args()
 
 
@@ -41,15 +40,14 @@ def get_compression_ratio(text: str):
     """
     # Strip timestamp tokens before compression measurement
     cleaned = TAG_RE.sub("", text)
-    compression_ratio = len(cleaned) / len(zlib.compress(cleaned.encode("utf-8")))
+    encoded = cleaned.encode("utf-8")
+    compression_ratio = len(encoded) / len(zlib.compress(encoded))
     return compression_ratio
 
 
 # ---------------------------------------------------------------------------
 # 1. compile once – these are the micro-second French heuristics
 # ---------------------------------------------------------------------------
-TAG_RE = re.compile(r"<\|[^|]+\|>")  # strip <|0.16|> etc.
-SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 FR_WORDS = (
     r"\b(?:que|qui|dans|avec|pour|chez|entre|sans|leur(?:s)?|une?|des?|du|la|le|les"
@@ -68,15 +66,8 @@ EN_WORDS = (
 EN_APOS = r"\b(?:i|you|we|they|it|he|she)\s*'"  # i'm / you're / it's ...
 EN_HEURISTIC_RE = re.compile(f"(?:{EN_WORDS}|{EN_APOS})", re.I)
 
-# ---------------------------------------------------------------------------
-# 2. fastlid setup – restrict search space to languages relevant for filtering
-# ---------------------------------------------------------------------------
-fastlid.set_languages = ["fr", "de", "en"]
 
-
-# ---------------------------------------------------------------------------
-# 3. the combined detector
-# ---------------------------------------------------------------------------
+# Language identification is loaded on demand and keeps the full label set.
 def is_french(line: str, prob_th: float = 0.85) -> bool:
     """
     If regexes matches, double check with model.
@@ -90,7 +81,7 @@ def is_french(line: str, prob_th: float = 0.85) -> bool:
             lang, prob = fastlid(txt)
         except (IndexError, ValueError):  # no label came back
             return False
-        return lang == "fr"  # and prob >= prob_th
+        return lang == "fr" and prob >= prob_th
 
     return False
 
@@ -106,16 +97,9 @@ def is_english(line: str, prob_th: float = 0.85) -> bool:
             lang, prob = fastlid(txt)
         except (IndexError, ValueError):
             return False
-        return lang == "en"  # and prob >= prob_th
+        return lang == "en" and prob >= prob_th
 
     return False
-
-
-def sanitize_example_id(raw_id) -> str:
-    value = str(raw_id).strip()
-    value = value.replace("/", "_").replace("\\", "_")
-    value = SAFE_ID_RE.sub("_", value)
-    return value.strip("._") or "sample"
 
 
 def fuse_until_limits(
@@ -126,29 +110,23 @@ def fuse_until_limits(
     drop_text: list = None,
 ) -> bool:
     """Rewrite *subs* in‑place, merging cues while combined cue stays <= limits.
-    
+
     Cues containing any word in skip_words will not be merged with others.
     Phrases in drop_text are removed from cue text before merging.
 
     Returns True if *subs* was modified.
     """
-    if pysubs2 is None or not subs:
+    import pysubs2
+
+    if not subs:
         return False
-    
+
     skip_words = skip_words or []
     drop_text = drop_text or []
 
-    def remove_drop_text(text: str) -> str:
-        for fragment in drop_text:
-            if fragment:
-                text = re.sub(re.escape(fragment), "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s+([,.;:!?])", r"\1", text)
-        text = re.sub(r"\s{2,}", " ", text)
-        return text.strip()
-
     text_changed = False
     for cue in subs:
-        cleaned_text = remove_drop_text(cue.text)
+        cleaned_text = drop_text_fragments(cue.text, drop_text)
         if cleaned_text != cue.text:
             text_changed = True
         cue.text = cleaned_text
@@ -158,19 +136,21 @@ def fuse_until_limits(
 
     merged = pysubs2.SSAFile()
     current = subs[0].copy()
-    
+
     # If first cue contains skip word, don't merge with anything
     current_has_skip = contains_skip_word(current.text)
 
     for cue in subs[1:]:
         cue_has_skip = contains_skip_word(cue.text)
         combined_text = f"{current.text.rstrip()} {cue.text.lstrip()}"
-        combined_dur = (cue.end - current.start) / 1000  # ms → s
+        combined_dur = (max(cue.end, current.end) - current.start) / 1000
 
-        within_limits = len(combined_text) <= max_chars and combined_dur <= max_duration
-        
+        plain_length = len((current.plaintext + " " + cue.plaintext).replace("\n", " "))
+        within_limits = plain_length <= max_chars and combined_dur <= max_duration
+
         # Don't merge if either cue contains a skip word
-        can_merge = within_limits and not current_has_skip and not cue_has_skip
+        monotone = current.start < current.end <= cue.start < cue.end
+        can_merge = monotone and within_limits and not current_has_skip and not cue_has_skip
 
         if can_merge:
             # Safe to merge: extend current cue
@@ -185,9 +165,13 @@ def fuse_until_limits(
     merged.append(current)
 
     # Detect change by comparing lengths or any differing fields
-    changed = text_changed or len(merged) != len(subs) or any(
-        m.start != s.start or m.end != s.end or m.text != s.text
-        for m, s in zip(merged, subs)
+    changed = (
+        text_changed
+        or len(merged) != len(subs)
+        or any(
+            m.start != s.start or m.end != s.end or m.text != s.text
+            for m, s in zip(merged, subs, strict=False)
+        )
     )
 
     if changed:
@@ -196,161 +180,50 @@ def fuse_until_limits(
     return changed
 
 
-def netflix_normalize_file(
-    path: str, skip_words: list = None, drop_text: list = None
-) -> None:
-    """Normalize SRT file using Netflix-style limits.
-    
-    Args:
-        path: Path to the SRT file
-        skip_words: List of words - cues containing these will not be merged
-        drop_text: List of phrases to remove from cue text before merging
-    """
-    try:
-        subs = pysubs2.load(path)
-    except Exception as exc:
-        print(f"Skipping Netflix normalization for {path}: {exc}")
-        return
+def netflix_normalize_file(path, skip_words=None, drop_text=None, output_path=None) -> Path:
+    """Write normalized subtitles to a separate file, preserving SRT/VTT format."""
+    import pysubs2
 
-    if fuse_until_limits(subs, skip_words=skip_words, drop_text=drop_text):
-        subs.save(path, format_="srt")  # overwrite in place
-        print(f"Updated {(path)}")
+    from whisper_prep.subtitling.parse import read_cues
+
+    path = Path(path)
+    destination = (
+        Path(output_path)
+        if output_path
+        else path.with_name(path.stem + ".normalized" + path.suffix)
+    )
+    if destination.resolve() == path.resolve():
+        raise ValueError("Normalized subtitles must not overwrite the source")
+    cues = read_cues(path)
+    subs = pysubs2.SSAFile()
+    subs.extend(pysubs2.SSAEvent(start=cue.start, end=cue.end, text=cue.text) for cue in cues)
+    fuse_until_limits(subs, skip_words=skip_words, drop_text=drop_text)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    subs.save(str(destination), format_=path.suffix.lower().lstrip("."))
+    return destination
 
 
 def netflix_normalize_all_srts_in_folder(
-    folder: str = ".", skip_words: list = None, drop_text: list = None
-) -> None:
-    """One-liner helper: normalize all .srt files in *folder*."""
-    for file in glob(os.path.join(folder, "*.srt")):
-        netflix_normalize_file(file, skip_words=skip_words, drop_text=drop_text)
+    folder=".", skip_words=None, drop_text=None, output_dir=None
+):
+    folder = Path(folder)
+    destination = Path(output_dir) if output_dir else folder / "normalized"
+    return [
+        netflix_normalize_file(path, skip_words, drop_text, destination / path.name)
+        for path in sorted(folder.iterdir())
+        if path.is_file() and path.suffix.lower() in {".srt", ".vtt"}
+    ]
 
 
 def save_hu_dataset_locally(config, audio_dir, transcript_dir):
-    """Save HuggingFace dataset examples locally as audio and SRT or collect sentences.
-    Returns local TSV metadata paths.
-    """
-    split_name = config.get("hu_input_split", config["split_name"])
-    out_folder = config["out_folder"]
-    input_format = config.get("hf_input_format", "auto")
-    if input_format not in {"auto", "srt", "sentences"}:
-        raise ValueError(
-            "hf_input_format must be one of 'auto', 'srt', or 'sentences', "
-            f"got {input_format!r}"
-        )
+    from whisper_prep.dataset.download import save_hu_dataset_locally as download
 
-    hu_names = config["hu_datasets"]
-
-    datasets_list = [load_dataset(name, split=split_name) for name in hu_names]
-    overlapping_cols = set.intersection(*[set(ds.column_names) for ds in datasets_list])
-    datasets_list = [
-        ds.select_columns(sorted(overlapping_cols)) for ds in datasets_list
-    ]
-    ds = concatenate_datasets(datasets_list)
-
-    # Optional filtering: keep only a predefined list of episode IDs.
-    episode_ids_file = config.get("hu_episode_ids_file")
-    if episode_ids_file:
-        ids_path = Path(episode_ids_file)
-        if not ids_path.exists():
-            raise FileNotFoundError(f"Episode IDs file not found: {ids_path}")
-        with open(ids_path, "r", encoding="utf-8") as f:
-            allowed_ids = {line.strip() for line in f if line.strip()}
-        if "id" not in ds.column_names:
-            raise ValueError(
-                "hu_episode_ids_file was provided, but source dataset has no 'id' column."
-            )
-        ds = ds.filter(lambda example: str(example["id"]) in allowed_ids)
-
-    sentence_entries = []
-    srt_entries = []
-    for idx, example in tqdm(
-        enumerate(ds), total=len(ds), desc=f"Saving examples to {audio_dir}"
-    ):
-        audio_field = example.get("audio")
-        if isinstance(audio_field, dict) and "array" in audio_field and "sampling_rate" in audio_field:
-            audio_array = audio_field["array"]
-            sampling_rate = audio_field["sampling_rate"]
-        elif hasattr(audio_field, "get_all_samples"):
-            # datasets>=4 may expose audio as an AudioDecoder object
-            samples = audio_field.get_all_samples()
-            audio_array = samples.data
-            sampling_rate = samples.sample_rate
-            if hasattr(audio_array, "detach"):
-                audio_array = audio_array.detach()
-            if hasattr(audio_array, "cpu"):
-                audio_array = audio_array.cpu()
-            if hasattr(audio_array, "numpy"):
-                audio_array = audio_array.numpy()
-        else:
-            raise ValueError(f"Could not handle audio field {audio_field}")
-
-        import numpy as np
-        import soundfile as sf
-
-        audio_id = sanitize_example_id(example.get("id", idx))
-        dest = audio_dir / f"{audio_id}.wav"
-        audio_array = np.asarray(audio_array)
-        if audio_array.ndim == 2 and audio_array.shape[0] <= 8 and audio_array.shape[1] > audio_array.shape[0]:
-            # torchcodec may return channel-first tensors
-            audio_array = audio_array.T
-        if audio_array.dtype not in (np.float32, np.float64, np.int16, np.int32):
-            audio_array = audio_array.astype(np.float32)
-        sf.write(str(dest), audio_array, int(sampling_rate), format="WAV")
-
-        srt_text = example.get("srt")
-        use_srt = input_format != "sentences" and srt_text is not None
-        if input_format == "srt" and srt_text is None:
-            raise ValueError(
-                "hf_input_format is 'srt', but at least one dataset entry has no 'srt' column/value"
-            )
-
-        if use_srt:
-            srt_file = transcript_dir / f"{dest.stem}.srt"
-            with open(srt_file, "w", encoding="utf-8") as f:
-                f.write(srt_text)
-            srt_entries.append(
-                {
-                    "srt_path": str(srt_file),
-                    "audio_path": str(dest),
-                    "language": example.get("language", config.get("language", "")),
-                    "id": dest.stem,
-                }
-            )
-        else:
-            text = example.get("sentence") or example.get("text")
-            if text is None:
-                raise ValueError(
-                    "Sentence-based dataset entry missing 'sentence' or 'text' column"
-                )
-            client_id = example.get("client_id", example.get("speaker_id", "")) or ""
-            sentence_entries.append(
-                {"path": dest.name, "sentence": text, "client_id": client_id}
-            )
-    sentence_tsvs = []
-    if sentence_entries:
-        tsv_file = Path(out_folder, "hf_sentences.tsv")
-        with open(tsv_file, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(
-                f, delimiter="\t", fieldnames=["path", "sentence", "client_id"]
-            )
-            writer.writeheader()
-            writer.writerows(sentence_entries)
-        sentence_tsvs.append(str(tsv_file))
-    transcripts_tsv = None
-    if srt_entries:
-        tsv_file = Path(out_folder, "transcripts_mapping.tsv")
-        with open(tsv_file, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(
-                f,
-                delimiter="\t",
-                fieldnames=["srt_path", "audio_path", "language", "id"],
-            )
-            writer.writeheader()
-            writer.writerows(srt_entries)
-        transcripts_tsv = str(tsv_file)
-    return DownloadedDatasetPaths(sentence_tsvs, transcripts_tsv)
+    return download(config, audio_dir, transcript_dir)
 
 
-if __name__ == "__main__":
+def __getattr__(name):
+    if name == "DownloadedDatasetPaths":
+        from whisper_prep.dataset.download import DownloadedDatasetPaths
 
-    netflix_normalize_all_srts_in_folder("src/whisper_prep/")
+        return DownloadedDatasetPaths
+    raise AttributeError(name)

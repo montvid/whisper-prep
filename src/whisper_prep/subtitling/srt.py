@@ -1,8 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
-from string import Template
-from typing import Union
 
 
 @dataclass
@@ -13,44 +11,44 @@ class Caption:
     offset: float = 0
 
     def start_timestamp(self) -> str:
-        td = timedelta(seconds=self.start_second + self.offset)
-        return format_delta(delta=td, pattern="{h}:{m}:{s}.{ms}")
+        return format_delta(timedelta(seconds=self.start_second + self.offset), "{h}:{m}:{s},{ms}")
 
     def end_timestamp(self) -> str:
-        td = timedelta(seconds=self.end_second + self.offset)
-        return format_delta(delta=td, pattern="{h}:{m}:{s}.{ms}")
+        return format_delta(timedelta(seconds=self.end_second + self.offset), "{h}:{m}:{s},{ms}")
 
 
 def format_delta(delta: timedelta, pattern: str) -> str:
-    d = {}
-    d["h"], rem = divmod(delta.seconds, 3600)
-    d["m"], d["s"] = divmod(rem, 60)
-    d["ms"] = delta.microseconds // 1000
-
-    d["h"] = f'{d["h"]:02d}'
-    d["m"] = f'{d["m"]:02d}'
-    d["s"] = f'{d["s"]:02d}'
-    d["ms"] = f'{d["ms"]:03d}'
-
-    return pattern.format(**d)
+    total_ms = round(delta.total_seconds() * 1000)
+    if total_ms < 0:
+        raise ValueError("Subtitle timestamps must be nonnegative")
+    seconds, ms = divmod(total_ms, 1000)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return pattern.format(h=f"{hours:02d}", m=f"{minutes:02d}", s=f"{seconds:02d}", ms=f"{ms:03d}")
 
 
-def generate_srt(captions: list[Caption], save_path: Union[str, Path]) -> None:
-    srt_content = ""
-
-    temp_str = "${index}\n${start} --> ${end}\n${text}\n\n"
-    temp_obj = Template(temp_str)
-
-    for idx, caption in enumerate(captions):
-        if idx > 0:
-            prev_end = captions[idx - 1].end_second + captions[idx - 1].offset
-            curr_start = caption.start_second + caption.offset
-            if curr_start <= prev_end:
-                caption.start_second = prev_end + 0.02 - captions[idx - 1].offset
-
-        srt_content += temp_obj.substitute(
-            index=idx + 1, start=caption.start_timestamp(), end=caption.end_timestamp(), text=caption.text
+def generate_srt(captions: list[Caption], save_path: str | Path) -> None:
+    repaired = []
+    for original in captions:
+        cue = replace(
+            original,
+            start_second=original.start_second + original.offset,
+            end_second=original.end_second + original.offset,
+            offset=0,
         )
-
-    with open(save_path, "w", encoding="utf-8") as srt_file:
-        srt_file.write(srt_content)
+        if cue.start_second < 0 or cue.end_second <= cue.start_second:
+            raise ValueError(f"Invalid generated caption: {original}")
+        if repaired and cue.start_second < repaired[-1].end_second:
+            previous = repaired[-1]
+            if cue.start_second > previous.start_second:
+                previous.end_second = cue.start_second
+            else:
+                previous.text += " " + cue.text
+                previous.end_second = max(previous.end_second, cue.end_second)
+                continue
+        repaired.append(cue)
+    content = "".join(
+        f"{i}\n{cue.start_timestamp()} --> {cue.end_timestamp()}\n{cue.text}\n\n"
+        for i, cue in enumerate(repaired, 1)
+    )
+    Path(save_path).write_text(content, encoding="utf-8")

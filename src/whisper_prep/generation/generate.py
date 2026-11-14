@@ -1,207 +1,172 @@
+"""Deterministic sentence fusion with bounded per-speaker queues."""
+
+import logging
 import random
-import uuid
+from collections import deque
 from functools import partial
 from inspect import signature
-from multiprocessing.pool import Pool
+from multiprocessing import get_context
 from pathlib import Path
-from typing import Union
 
-import pandas as pd
+import numpy as np
 from pydub import AudioSegment
 from tqdm import tqdm
 
 from whisper_prep.audio.io import read_audio, save_audio_segment
 from whisper_prep.audio.vad import silero_vad_collector
 from whisper_prep.dataset.convert import combine_tsvs_to_dataframe
-from whisper_prep.subtitling.srt import Caption, generate_srt
 from whisper_prep.generation.text_normalizer import normalize_text as normalize_text_
+from whisper_prep.subtitling.srt import Caption, generate_srt
+
+LOGGER = logging.getLogger(__name__)
 
 
-def _get_number_of_rows(speaker_groups) -> int:
-    return sum(len(data) for _, data in speaker_groups.items())
+def _init_fusion_worker():
+    import torch
 
-
-def _return_random_example(speaker_groups):
-    filtered_speaker = pd.DataFrame()
-    while len(filtered_speaker) == 0:
-        # Choose a random speaker
-        speaker = random.choice(list(speaker_groups.keys()))
-        # Further filter to find segments from the chosen speaker
-        filtered_speaker = speaker_groups[speaker]
-    return filtered_speaker.iloc[0]
-
-
-def _generate_wrapper(
-    sample: dict,
-    audios_folder: Union[Path, str],
-    transcripts_folder: Union[Path, str],
-    overlap_chance: float,
-    max_overlap_chance: float,
-    max_overlap_duration: float,
-    vad_chance: float,
-    keep_empty_chance: float,
-    audio_format: str,
-) -> None:
-    try:
-        return _generate(
-            constructed_samples=sample,
-            audios_folder=audios_folder,
-            transcripts_folder=transcripts_folder,
-            overlap_chance=overlap_chance,
-            max_overlap_chance=max_overlap_chance,
-            max_overlap_duration=max_overlap_duration,
-            vad_chance=vad_chance,
-            keep_empty_chance=keep_empty_chance,
-            audio_format=audio_format,
-        )
-    except Exception as e:
-        print(f"Error in sample {sample}: {e}")
-        return None
+    torch.set_num_threads(1)
 
 
 def _execute_parallel_process(func, args, n_jobs: int) -> list:
-    # For small workloads, run sequentially to avoid multiprocessing overhead
-    if len(args) <= n_jobs:
-        results = []
-        for arg in args:
-            results.append(func(arg))
-        return results
+    if n_jobs < 1:
+        raise ValueError("n_jobs must be at least 1")
+    if n_jobs == 1:
+        return [func(arg) for arg in args]
+    with get_context("spawn").Pool(n_jobs, initializer=_init_fusion_worker) as executor:
+        return list(tqdm(executor.imap(func, args), desc="Fusing sentences"))
 
-    with Pool(n_jobs) as executor:
-        results = list(tqdm(executor.imap_unordered(func, args), total=len(args)))
-    return results
+
+def _ordered_samples(data, maintain_speaker_chance, rng):
+    groups = {}
+    for row in data.itertuples(index=False):
+        groups.setdefault(row.client_id, deque()).append(row)
+    active = list(groups)
+    positions = {speaker: index for index, speaker in enumerate(active)}
+    previous = None
+    while active:
+        if previous in positions and rng.random() < maintain_speaker_chance:
+            speaker = previous
+        else:
+            speaker = rng.choice(active)
+        row = groups[speaker].popleft()
+        if not groups[speaker]:
+            position = positions.pop(speaker)
+            last = active.pop()
+            if position < len(active):
+                active[position] = last
+                positions[last] = position
+        previous = speaker
+        yield row
+
+
+def _generate_wrapper(sample, *, seed=42, **kwargs):
+    index, clips = sample
+    try:
+        return _generate(clips, seed=seed + index, file_name=f"{index:08d}", **kwargs)
+    except Exception:
+        LOGGER.exception("Failed to fuse sample %s (%d input clips)", index, len(clips))
+        raise
 
 
 def _generate(
-    constructed_samples: list[dict],
-    audios_folder: Union[Path, str],
+    constructed_samples,
+    audios_folder,
     transcripts_folder,
-    overlap_chance: float,
-    max_overlap_chance: float,
-    max_overlap_duration: float,
-    vad_chance: float,
-    keep_empty_chance: float,
-    audio_format: str = "mp3",
-) -> None:
-    offset = 0
+    overlap_chance,
+    max_overlap_chance,
+    max_overlap_duration,
+    vad_chance,
+    keep_empty_chance,
+    audio_format="mp3",
+    seed=42,
+    file_name="00000000",
+):
+    rng = random.Random(seed)
+    offset = 0.0
     combined_audio = AudioSegment.empty()
     captions = []
     previous_space_after_speech = 0.0
-
     for segment in constructed_samples:
-        audio_file_path = segment["path"]
         sentence = (segment["sentence"] or "").strip()
-        audio_segment = read_audio(audio_file_path, resample_rate=16000)
-        audio_duration_seconds = audio_segment.duration_seconds
-
-        # Determine speech bounds with VAD only for the configured sample rate.
-        if random.random() < vad_chance:
-            start_second, end_second = silero_vad_collector(audio_file_path)
-            vad_found_speech = end_second is not None and end_second > start_second
+        audio_segment = (
+            read_audio(segment["path"], resample_rate=16000).set_channels(1).set_sample_width(2)
+        )
+        duration = audio_segment.duration_seconds
+        if rng.random() < vad_chance:
+            # Use the decoded PCM already in memory, rather than decoding twice.
+            waveform = np.asarray(audio_segment.get_array_of_samples(), dtype=np.float32) / 32768
+            start, end = silero_vad_collector(waveform)
+            found_speech = end is not None and end > start
         else:
-            start_second, end_second = 0.0, audio_duration_seconds
-            vad_found_speech = True
-
-        if not sentence or not vad_found_speech:
-            if random.random() >= keep_empty_chance:
+            start, end, found_speech = 0.0, duration, True
+        if not sentence or not found_speech:
+            if rng.random() >= keep_empty_chance:
                 continue
-            sentence = ""
-            start_second = 0.0
-            end_second = audio_duration_seconds
-
-        overlap_move = 0
-
-        if len(combined_audio) > 0 and random.random() < overlap_chance:
-            total_space = previous_space_after_speech + start_second
-
-            if random.random() < max_overlap_chance:
-                overlap_move = total_space + max_overlap_duration
-            else:
-                overlap_move = random.uniform(0, total_space + max_overlap_duration)
-
-            overlap_move_ms = round(overlap_move * 1000)
-            overlap_audio = audio_segment[:overlap_move_ms]
-            rest_audio = audio_segment[overlap_move_ms:]
-
-            combined_audio = combined_audio.overlay(
-                overlap_audio, position=len(combined_audio) - overlap_move_ms
+            sentence, start, end = "", 0.0, duration
+        overlap = 0.0
+        if len(combined_audio) and rng.random() < overlap_chance:
+            limit = min(
+                previous_space_after_speech + start + max_overlap_duration,
+                combined_audio.duration_seconds,
+                duration,
             )
-            combined_audio += rest_audio
+            overlap = limit if rng.random() < max_overlap_chance else rng.uniform(0, limit)
+            overlap_ms = round(overlap * 1000)
+            overlap = overlap_ms / 1000
+            combined_audio = (
+                combined_audio.overlay(
+                    audio_segment[:overlap_ms], position=len(combined_audio) - overlap_ms
+                )
+                + audio_segment[overlap_ms:]
+            )
         else:
             combined_audio += audio_segment
-
         if sentence:
-            captions.append(
-                Caption(
-                    start_second=start_second - overlap_move + offset,
-                    end_second=offset + end_second - overlap_move,
-                    text=sentence,
-                )
-            )
-
-        offset += audio_segment.duration_seconds - overlap_move
-        previous_space_after_speech = audio_duration_seconds - end_second
-
-    file_name = str(uuid.uuid4())
-
-    if len(combined_audio) == 0:
-        return
-
-    save_path_audio = Path(audios_folder, f"{file_name}.{audio_format}")
-    save_path_srt = Path(transcripts_folder, f"{file_name}.srt")
-
-    save_audio_segment(combined_audio, save_path_audio, format=audio_format)
-    generate_srt(captions, save_path_srt)
+            captions.append(Caption(start - overlap + offset, end - overlap + offset, sentence))
+        offset += duration - overlap
+        previous_space_after_speech = duration - end
+    if not len(combined_audio):
+        return False
+    audio_path = Path(audios_folder, f"{file_name}.{audio_format}")
+    transcript_path = Path(transcripts_folder, f"{file_name}.srt")
+    if audio_path.exists() or transcript_path.exists():
+        raise FileExistsError(f"Refusing to overwrite fused sample {file_name}")
+    save_audio_segment(combined_audio, audio_path, format=audio_format)
+    generate_srt(captions, transcript_path)
+    return True
 
 
 def generate_fold_from_yaml(config: dict):
-    """See test.yaml in tests/assets/configs/test.yaml on the setup of the config."""
-    # Get the list of parameters accepted by generate_fold
-    generate_fold_params = signature(generate_fold).parameters
+    from dataclasses import fields
 
-    # Filter the flat_config to keep only the parameters that generate_fold accepts
-    filtered_config = {k: v for k, v in config.items() if k in generate_fold_params}
+    from whisper_prep.config import PipelineConfig
 
-    # Call generate_fold with the filtered configuration
-    generate_fold(**filtered_config)
+    unknown = set(config) - {field.name for field in fields(PipelineConfig)} - {"out_folder"}
+    if unknown:
+        raise ValueError(f"Unknown configuration keys: {', '.join(sorted(unknown))}")
+    parameters = signature(generate_fold).parameters
+    return generate_fold(**{key: value for key, value in config.items() if key in parameters})
 
 
 def generate_fold(
-    tsv_paths: list[Union[str, Path]],
-    clips_folders: list[Union[str, Path]],
-    partials: list[float],
-    out_folder: Union[str, Path],
-    maintain_speaker_chance: float,
-    n_samples_per_srt: int,
-    normalize_text: bool,
-    overlap_chance: float,
-    max_overlap_chance: float,
-    max_overlap_duration: float,
-    vad_chance: float = 1.0,
-    keep_empty_chance: float = 0.0,
-    audio_format: str = "mp3",
-    n_jobs: int = 4,
-    seed: int = 42,
-) -> None:
-    """
-    Generates a data fold for audio processing.
-
-    Parameters:
-    - tsv_paths (list[Union[str, Path]]): List of paths to the .tsv files containing audio metadata.
-    - clips_folders (list[Union[str, Path]]): List of folders where audio clips are stored.
-    - partials (list[float]): List of partial amounts to split the data.
-    - out_folder (Union[str, Path]): Output directory for the generated fold.
-    - maintain_speaker_chance (float): Probability of maintaining the same speaker in consecutive samples.
-    - n_samples_per_srt (int): Number of samples to generate per .srt file.
-    - overlap_chance (float): Probability that clips will overlap.
-    - max_overlap_chance (float): Maximum allowed overlap probability.
-    - max_overlap_duration (float): Maximum duration for overlap.
-    - vad_chance (float): Probability of running VAD for a sentence clip.
-    - keep_empty_chance (float): Probability of keeping blank text or no-speech clips.
-    - audio_format (str): Desired audio format for output files.
-    - n_jobs (int, optional): Number of jobs to run in parallel. Default is 2.
-    - seed (int, optional): Seed for random number generation. Default is 42.
-    """
+    tsv_paths,
+    clips_folders,
+    partials,
+    out_folder,
+    maintain_speaker_chance=0.5,
+    n_samples_per_srt=16,
+    normalize_text=False,
+    overlap_chance=0.5,
+    max_overlap_chance=0.2,
+    max_overlap_duration=0.2,
+    vad_chance=1.0,
+    keep_empty_chance=0.0,
+    audio_format="mp3",
+    n_jobs=4,
+    seed=42,
+    tsv_quoting="csv",
+    normalizer_language=None,
+):
     for name, value in {
         "maintain_speaker_chance": maintain_speaker_chance,
         "overlap_chance": overlap_chance,
@@ -211,107 +176,43 @@ def generate_fold(
     }.items():
         if not 0 <= value <= 1:
             raise ValueError(f"{name} must be between 0 and 1, got {value}")
-
-    data = combine_tsvs_to_dataframe(tsv_paths, clips_folders, partials=partials)
-
-    Path(out_folder).mkdir(parents=True, exist_ok=True)
-
-    audios_folder = Path(out_folder, "audios")
-    audios_folder.mkdir(parents=True, exist_ok=True)
-    transcripts_folder = Path(out_folder, "transcripts")
-    transcripts_folder.mkdir(parents=True, exist_ok=True)
-
-    # Shuffle the dataset
-    data = data.sample(frac=1, random_state=seed)
-
-    # Initialize variables
-    last_speaker = None
-    constructed_samples = []
-    data["picked"] = 0
-    sequence = []
-    n_samples_picked = 0
-
-    fold_data = data.copy()
-
-    speaker_groups = {speaker: data for speaker, data in fold_data.groupby("client_id")}
-
-    remaining_samples = _get_number_of_rows(speaker_groups)
-
-    while remaining_samples > 0:
-        # Check if the current segment should maintain the same speaker as the previous segment
-        if last_speaker is not None and random.random() < maintain_speaker_chance:
-            # Further filter to find segments from the same speaker
-            filtered_speaker = speaker_groups[last_speaker]
-            # Choose a segment from the same speaker if available
-            if len(filtered_speaker) > 0:
-                sample = filtered_speaker.iloc[0]
-                # If no segment from the same speaker, choose from any available segments
-            else:
-                sample = _return_random_example(speaker_groups)
-        else:
-            # If maintaining the same speaker is not required, choose any available segment
-            sample = _return_random_example(speaker_groups)
-
-        # Extract sentence and audio file path from the chosen sample
-        sentence = sample["sentence"]
-        audio_file_path = sample["audio_file_path"]
-        last_speaker = sample["client_id"]
-        n_samples_picked += 1
-        fold_data.loc[sample.name, "picked"] = 1
-        remaining_samples -= 1
-
-        # Normalize the sentence
-        if normalize_text:
-            sentence = normalize_text_(sentence)
-
-        # Remove sample for speaker groups
-        speaker_groups[last_speaker] = speaker_groups[last_speaker].iloc[1:]
-
-        # Add the chosen sample to the sequence
-        sequence.append(
-            {
-                "path": audio_file_path,
-                "sentence": sentence,
-                "speaker_id": sample["client_id"],
-            }
+    if n_samples_per_srt < 1 or n_jobs < 1 or max_overlap_duration < 0:
+        raise ValueError(
+            "n_samples_per_srt and n_jobs must be positive; max_overlap_duration must be nonnegative"
         )
+    if audio_format not in {"mp3", "wav", "flac"}:
+        raise ValueError("audio_format must be mp3, wav or flac")
+    audios_folder, transcripts_folder = Path(out_folder, "audios"), Path(out_folder, "transcripts")
+    for folder in (audios_folder, transcripts_folder):
+        if folder.exists() and any(folder.iterdir()):
+            raise FileExistsError(f"Fusion output is not empty: {folder}")
+    data = combine_tsvs_to_dataframe(tsv_paths, clips_folders, partials, seed, tsv_quoting)
+    data = data.sample(frac=1, random_state=seed)
+    for folder in (audios_folder, transcripts_folder):
+        folder.mkdir(parents=True, exist_ok=True)
 
-        # Check if the limit of samples has been reached
-        if n_samples_picked >= n_samples_per_srt:
-            # Add the completed sequence to the list of constructed samples
-            constructed_samples.append(sequence)
-            print(f"Used {len(sequence)} samples for this SRT.")
-            sequence = []
-            n_samples_picked = 0
-            print(f"Constructed {len(constructed_samples)} SRTs.")
-            print(f"Remaining samples: {remaining_samples}")
-
-        # If there are too many SRTs, the list is getting to big and append to list will come to a halt.
-        if (
-            len(constructed_samples) * n_samples_per_srt > 50000
-        ):  # Lists starts to get extremely slow if it has more than 50k items.
-            generate_ = partial(
-                _generate_wrapper,
-                audios_folder=audios_folder,
-                transcripts_folder=transcripts_folder,
-                overlap_chance=overlap_chance,
-                max_overlap_chance=max_overlap_chance,
-                max_overlap_duration=max_overlap_duration,
-                vad_chance=vad_chance,
-                keep_empty_chance=keep_empty_chance,
-                audio_format=audio_format,
+    def batches():
+        sequence = []
+        index = 0
+        for row in _ordered_samples(data, maintain_speaker_chance, random.Random(seed)):
+            text = (
+                normalize_text_(row.sentence, language=normalizer_language)
+                if normalize_text
+                else row.sentence
             )
+            sequence.append(
+                {"path": row.audio_file_path, "sentence": text, "speaker_id": row.client_id}
+            )
+            if len(sequence) == n_samples_per_srt:
+                yield index, sequence
+                index += 1
+                sequence = []
+        if sequence:
+            yield index, sequence
 
-            # Parallel execution with progress tracking
-            _execute_parallel_process(generate_, constructed_samples, n_jobs)
-            constructed_samples = []
-
-    # Add the last sequence if it is not empty
-    if len(sequence) > 0:
-        constructed_samples.append(sequence)
-
-    generate_ = partial(
+    worker = partial(
         _generate_wrapper,
+        seed=seed,
         audios_folder=audios_folder,
         transcripts_folder=transcripts_folder,
         overlap_chance=overlap_chance,
@@ -321,6 +222,10 @@ def generate_fold(
         keep_empty_chance=keep_empty_chance,
         audio_format=audio_format,
     )
-
-    # Parallel execution with progress tracking
-    _execute_parallel_process(generate_, constructed_samples, n_jobs)
+    results = _execute_parallel_process(worker, batches(), n_jobs)
+    LOGGER.info(
+        "Fusion: %d inputs, %d files created, %d empty batches",
+        len(data),
+        sum(results),
+        results.count(False),
+    )

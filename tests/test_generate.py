@@ -1,122 +1,45 @@
-import shutil
-import unittest
 from pathlib import Path
 
-import numpy as np
-import yaml
-from datasets import DatasetDict, load_from_disk
+from datasets import load_from_disk
 
 from whisper_prep import main
 from whisper_prep.generation.data_processor import DataProcessor
-from whisper_prep.generation.generate import generate_fold_from_yaml
+from whisper_prep.generation.generate import generate_fold
+
+ASSETS = Path(__file__).parent / "assets/tsv-data-example"
 
 
-class TestGenerate(unittest.TestCase):
-    def test_generate_data(self):
-        if Path("tests/assets/out/").exists():
-            shutil.rmtree("tests/assets/out/")
-        self.generate()
-        self.create()
-        self.integration()
-
-    def generate(self):
-        # Read YAML file
-        with open("tests/assets/configs/test.yaml", "r") as stream:
-            config = yaml.safe_load(stream)
-
-        out_folder_base = config["out_folder_base"]
-        dataset_name = config["dataset_name"]
-
-        out_folder = Path(out_folder_base, dataset_name, config["split_name"])
-        out_folder.mkdir(parents=True, exist_ok=True)
-
-        config["out_folder"] = out_folder
-
-        generate_fold_from_yaml(config)
-
-    def create(self):
-        generate_folder = "tests/assets/out/result/dataset_unittest/test/"
-        audio_dir = Path(generate_folder, "audios")
-        transcript_dir = Path(generate_folder, "transcripts")
-
-        output_dir = Path(
-            "tests/assets/out/result/dataset_unittest/test/created_dataset"
+def test_generate_data(tmp_path):
+    inputs = dict(
+        tsv_paths=[str(ASSETS / "sentences.tsv")],
+        clips_folders=[str(ASSETS / "clips")],
+        partials=[1.0],
+        normalize_text=True,
+        n_samples_per_srt=8,
+        n_jobs=1,
+        language="de",
+    )
+    direct = tmp_path / "direct"
+    generate_fold(
+        **{key: value for key, value in inputs.items() if key != "language"}, out_folder=direct
+    )
+    processor = DataProcessor(
+        audio_dir=direct / "audios",
+        transcript_dir=direct / "transcripts",
+        output=direct / "data.ljson",
+        dump_dir=direct / "dump",
+    )
+    processor.run()
+    assert DataProcessor.read_records(direct / "data.ljson")
+    for split in ("train", "val"):
+        main(
+            {
+                **inputs,
+                "out_folder_base": str(tmp_path),
+                "dataset_name": "corpus",
+                "split_name": split,
+            }
         )
-        output_file = Path(output_dir, "data.json")
-        dump_dir = Path(output_dir, "dump")
-
-        if Path(output_dir).exists():
-            shutil.rmtree(output_dir)
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        data_processor = DataProcessor(
-            audio_dir=audio_dir,
-            transcript_dir=transcript_dir,
-            output=output_file,
-            dump_dir=dump_dir,
-        )
-        data_processor.run()
-
-    def integration(self):
-        hf_paths = {}
-        for split in ["train", "val"]:
-            # Read YAML file
-            with open(f"tests/assets/configs/{split}.yaml", "r") as stream:
-                config = yaml.safe_load(stream)
-
-            main(config)
-
-            # Create paths
-            out_folder_base = config["out_folder_base"]
-            dataset_name = config["dataset_name"]
-            split_name = config["split_name"]
-            out_folder = Path(out_folder_base, dataset_name, split_name)
-            output_dir = Path(out_folder, "created_dataset")
-            dump_dir = Path(output_dir, "dump")
-            hf_folder = Path(out_folder, "hf")
-            hf_paths[split] = hf_folder
-
-            assert "dataset_unittest" in str(dump_dir)
-            assert "dataset_unittest" in str(hf_folder)
-            assert split in str(dump_dir)
-            assert split in str(hf_folder)
-            assert "tests/assets/out/result" in str(
-                dump_dir
-            ) or r"tests\assets\out\result" in str(dump_dir)
-            assert "tests/assets/out/result" in str(
-                hf_folder
-            ) or r"tests\assets\out\result" in str(hf_folder)
-
-            hf_dataset_loaded = load_from_disk(str(hf_folder))
-
-            print(hf_dataset_loaded[split_name])
-            assert (
-                len(
-                    np.setdiff1d(
-                        ["audio", "text", "language", "prompt"],
-                        hf_dataset_loaded[split_name].column_names,
-                    )
-                )
-                == 0
-            )
-            assert len(hf_dataset_loaded[split_name]) > 0 # At least one sample
-
-        # Create final dataset
-        dataset = DatasetDict()
-        print(hf_paths)
-        dataset["train"] = load_from_disk(str(hf_paths["train"]))["train"]
-        dataset["val"] = load_from_disk(str(hf_paths["val"]))["val"]
-
-        assert len(dataset) == 2, "Dataset does not contain two splits."
-        for split in ["train", "val"]:
-            assert (
-                len(
-                    np.setdiff1d(
-                        ["audio", "text", "language", "prompt"],
-                        dataset[split].column_names,
-                    )
-                )
-                == 0
-            )
-            assert len(dataset[split]) > 0 # At least one sample
+        dataset = load_from_disk(tmp_path / "corpus" / split / "hf")[split]
+        assert len(dataset) > 0
+        assert {"audio", "text", "language", "prompt"}.issubset(dataset.column_names)

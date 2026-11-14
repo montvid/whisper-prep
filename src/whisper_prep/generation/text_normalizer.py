@@ -19,7 +19,7 @@ def normalize_abbrv(text):
         "Std.": "Stunden",
         "Min.": "Minuten",
         "Sek.": "Sekunden",
-        "Jr.": "Jahr",
+        "Jr.": "Junior",
         "Tg.": "Tage",
         "m ü. M.": "Meter über Meer",
         "u.a.": "unter anderem",
@@ -53,9 +53,8 @@ def normalize_abbrv(text):
         "Dipl.": "Diplom",
         "Univ.": "Universität",
         "km/h": "Kilometer pro Stunde",
-        "ms/s": "Meter pro Sekunde",
+        "m/s": "Meter pro Sekunde",
         "Gebr.": "Gebrüder",
-        "äSEND$": " ",
         "Mio.": "Millionen",
         "Mia.": "Milliarden",
         "ähm": "",
@@ -99,7 +98,7 @@ def standardize_text(text: str) -> str:
         "„": '"',
         "‟": '"',
         # –––– Dashes & hyphens ––––––––––––––––––––––––––––––––––––––––––––––––
-        "-": "-",  # NON-BREAKING HYPHEN
+        "\u2011": "-",  # NON-BREAKING HYPHEN
         "–": "-",  # EN-DASH
         "—": "-",  # EM-DASH
         "−": "-",  # MINUS SIGN
@@ -135,18 +134,8 @@ def standardize_text(text: str) -> str:
 
 
 def normalize_capitalization(text):
-    words = text.split()  # Split the text into words
-    normalized_words = []
-
-    for word in words:
-        if len(word) > 4 and sum(1 for c in word if c.isupper()) == 2:
-            # Make the entire word lowercase and then capitalize the first letter
-            normalized_word = word[0].upper() + word[1:].lower()
-        else:
-            normalized_word = word
-        normalized_words.append(normalized_word)
-
-    return " ".join(normalized_words)
+    """Preserve names, acronyms and compounds; case cannot be inferred safely."""
+    return " ".join(text.split())
 
 
 ELLIPSIS = r"(?:\.{3}|…)"  # ASCII or Unicode
@@ -196,7 +185,6 @@ def tokenize(text):
 def collapse_ngrams(tokens, max_n=3):
     out, i = [], 0
     while i < len(tokens):
-
         # 1️⃣  Collapse runs of a single repeated token
         j = i + 1
         while j < len(tokens) and tokens[j] == tokens[i]:
@@ -209,10 +197,7 @@ def collapse_ngrams(tokens, max_n=3):
         # 2️⃣  Collapse repeated n-grams of length 2-max_n
         replaced = False
         for n in range(max_n, 1, -1):  # skip n=1 (already handled)
-            if (
-                i + 2 * n <= len(tokens)
-                and tokens[i : i + n] == tokens[i + n : i + 2 * n]
-            ):
+            if i + 2 * n <= len(tokens) and tokens[i : i + n] == tokens[i + n : i + 2 * n]:
                 k = i + n
                 while k + n <= len(tokens) and tokens[i : i + n] == tokens[k : k + n]:
                     k += n
@@ -302,6 +287,7 @@ class SwissNumberConverter:
 
         # remove apostrophes used the same way (Switzerland)
         text = re.sub(r"(?<=\d)'(?=\d{3}\b)", "", text)
+        return text
 
     def replace_komma_w_dot(self, text):
         # Normalizes a comma to a dot for numbers
@@ -309,50 +295,66 @@ class SwissNumberConverter:
         return re.sub(r"(?<=\d),(?=\d)", ".", text)
 
     def replace_currencies(self, text):
-        for symbol, word in self.currency_map.items():
-            text = text.replace(symbol, word)
-        return text
+        # Expand currency codes before symbols so a following '%' is still
+        # recognizable when deciding whether a number is monetary.
+        for symbol, word in sorted(
+            self.currency_map.items(), key=lambda item: not any(c.isalpha() for c in item[0])
+        ):
+            if symbol[0].isalpha():
+                # Currency abbreviations require an adjacent amount. "Fr. Müller"
+                # and programming-language acronyms are not monetary expressions.
+                code = re.escape(symbol)
+                text = re.sub(rf"(?<=\d)\s*{code}(?!\w)", lambda m: " " + word, text)
+                # A percentage after a currency-like word (e.g. PHP 50%)
+                # describes a proportion, not a monetary amount.
+                text = re.sub(
+                    rf"(?<!\w){code}\s*(?=\d+(?:[.,]\d+)?(?![\d.,]|\s*%))",
+                    lambda m: word + " ",
+                    text,
+                )
+            else:
+                text = re.sub(re.escape(symbol), lambda m: " " + word + " ", text)
+        return re.sub(r"[ \t]+", " ", text).strip()
 
     def convert_numbers(self, text):
-        # Unify number separators: thin/non-breaking spaces and apostrophes
-        text = re.sub(r"[\u00A0\u202F]", " ", text)
-        text = re.sub(r"(?<=\d)[ '\u00A0](?=\d{3}\b)", "", text)
+        # Only explicitly grouped numbers and the Unicode fraction slash are
+        # numerical notation. ASCII slashes can denote dates or opening hours.
+        text = self.combine_numbers(text)
 
-        # Convert fractions (1⁄2 or 1/2) to decimal
-        def _frac(m):
-            num, den = int(m.group(1)), int(m.group(2))
-            return str(num / den)
+        def fraction(match):
+            numerator, denominator = map(int, match.groups())
+            return str(numerator / denominator) if denominator else match[0]
 
-        text = re.sub(r"(\d+)[⁄/](\d+)", _frac, text)
+        text = re.sub(r"(\d+)⁄(\d+)", fraction, text)
         text = self.replace_currencies(text)
         text = self.replace_komma_w_dot(text)
 
-        # Group integer numbers into thousands using apostrophes and preserve decimals
-        def _group_num(m: re.Match) -> str:
-            integer = m.group(1)
-            fraction = m.group(2) or ""
-            grouped = f"{int(integer):,}".replace(",", "'")
-            return grouped + fraction
+        def group(match):
+            integer, fraction = match[1], match[2] or ""
+            if integer.startswith("0") or len(integer) <= 4:
+                return match[0]
+            return f"{int(integer):,}".replace(",", "'") + fraction
 
-        text = re.sub(r"\b(\d+)(\.\d+)?\b", _group_num, text)
-        return text
+        return re.sub(r"(?<![\w.])(\d+)(\.\d+)?(?![\w.])", group, text)
 
     def convert(self, text):
         """Alias for convert_numbers to support shorthand method name in tests."""
         return self.convert_numbers(text)
 
 
-def normalize_text(text):
-    text = unicodedata.normalize("NFKC", text)
-    text = text.translate(APOS_TABLE)
-    # Remove HTML font markup including content wrapped in <font>…</font>
-    text = remove_bracketed_text(text)
+def normalize_text(text, language=None):
+    """Conservative Unicode/whitespace cleanup; Swiss expansion is explicit.
+
+    Use language="de-CH" only for Swiss German training data. Other languages
+    retain their spelling, bracketed speech, numeric identifiers and symbols.
+    """
+    text = unicodedata.normalize("NFC", text).translate(APOS_TABLE)
+    text = re.sub(r"</?(?:font|i|b|u)(?:\s[^>]*)?>", "", text, flags=re.I)
     text = normalize_triple_dots(text)
-    text = normalize_abbrv(text)
-    text = normalize_capitalization(text)
-    text = standardize_text(text)
-    converter = SwissNumberConverter()
-    text = converter.convert_numbers(text)
-    text = text.replace("\n", " ")  # replace newlines with space
-    text = re.sub(r"\s{2,}", " ", text).strip()
-    return text
+    if language == "de-CH":
+        text = normalize_abbrv(text)
+        text = standardize_text(text)
+        text = SwissNumberConverter().convert_numbers(text)
+    elif language not in (None, "basic"):
+        raise ValueError("normalizer_language must be 'basic' or 'de-CH'")
+    return " ".join(text.split())

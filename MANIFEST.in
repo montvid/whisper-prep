@@ -1,0 +1,6 @@
+include README.md LICENSE pyproject.toml tox.ini uv.lock
+include config_sentence_fusion.yaml config_srt_splitting.yaml
+include download_hf_dataset.py upload_asr_dataset.py push_to_hub.py srt_to_hf_dataset.py
+recursive-include tests *.py *.yaml *.tsv *.md *.srt *.vtt *.mp3 *.wav
+recursive-include docs *.md
+recursive-include .github *.yml *.yaml

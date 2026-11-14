@@ -1,17 +1,16 @@
 import csv
+import json
 import re
 from pathlib import Path
 
-import json
 import torch
 import torchaudio
 
 from whisper_prep.audio.vad import silero_speech_ratio
-from whisper_prep.generation.data_processor import DataProcessor, SAMPLE_RATE
+from whisper_prep.generation.data_processor import SAMPLE_RATE, DataProcessor
 
-
-ASSETS = Path("tests/assets/empty_vad")
-PUNCTUATION_HALLUCINATION_ASSETS = Path("tests/assets/punctuation_hallucination")
+ASSETS = Path(__file__).parent / "assets/empty_vad"
+PUNCTUATION_HALLUCINATION_ASSETS = Path(__file__).parent / "assets/punctuation_hallucination"
 
 
 def test_silero_speech_ratio_separates_empty_text_examples():
@@ -129,7 +128,7 @@ def test_long_real_silence_is_split_and_kept_with_empty_vad(tmp_path):
 
     assert names == ["0.mp3", "30000.mp3", "60000.mp3"]
     assert all(record["text"] == "" for record in records)
-    assert all(Path(record["audio_path"]).exists() for record in records)
+    assert all((tmp_path / record["audio_path"]).exists() for record in records)
 
 
 def test_real_slice_drops_punctuation_hallucination_and_keeps_timestamps(tmp_path):
@@ -169,7 +168,6 @@ def test_real_slice_drops_punctuation_hallucination_and_keeps_timestamps(tmp_pat
         json.loads(line)
         for line in (tmp_path / "data.ljson").read_text(encoding="utf-8").splitlines()
     ]
-    names = [Path(record["audio_path"]).name for record in records]
     combined_text = "\n".join(record["text"] for record in records)
 
     assert records
@@ -179,7 +177,7 @@ def test_real_slice_drops_punctuation_hallucination_and_keeps_timestamps(tmp_pat
     assert all(not re.fullmatch(r"(?:<\|[0-9.]+\|>|\s|\.)+", record["text"]) for record in records)
 
     for record in records:
-        audio, sample_rate = torchaudio.load(record["audio_path"])
+        audio, sample_rate = torchaudio.load(tmp_path / record["audio_path"])
         duration_ms = round(audio.size(1) * 1000 / sample_rate)
         timestamps = [
             round(float(value) * 1000)
@@ -187,7 +185,7 @@ def test_real_slice_drops_punctuation_hallucination_and_keeps_timestamps(tmp_pat
         ]
         assert all(0 <= timestamp <= duration_ms for timestamp in timestamps)
 
-    report = tmp_path / "filtered_punctuation_hallucination_examples.csv"
+    report = tmp_path / "filtered_punctuation_hallucination_segments.tsv"
     assert report.exists()
     report_text = report.read_text(encoding="utf-8")
     assert "............" in report_text

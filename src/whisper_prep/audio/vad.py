@@ -1,15 +1,50 @@
 import collections
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterator
 
 import numpy as np
-from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
+
 try:
     from webrtcvad import Vad
 except ImportError:  # optional dependency; only needed for VoiceActivityDetector
     Vad = None
 
-SILERO_MODEL = load_silero_vad()
+
+@lru_cache(maxsize=1)
+def get_vad_model():
+    from silero_vad import load_silero_vad
+
+    return load_silero_vad()
+
+
+def read_audio(path):
+    from silero_vad import read_audio as decode
+
+    return decode(path, sampling_rate=16000)
+
+
+def get_speech_timestamps(*args, **kwargs):
+    from silero_vad import get_speech_timestamps as detect
+
+    return detect(*args, **kwargs)
+
+
+def _waveform(audio):
+    from pathlib import Path
+
+    import torch
+
+    if isinstance(audio, (str, Path)):
+        return read_audio(str(audio))
+    return torch.as_tensor(audio, dtype=torch.float32)
+
+
+def __getattr__(name):
+    if name == "SILERO_MODEL":  # Compatibility for callers of the old module constant.
+        return get_vad_model()
+    raise AttributeError(name)
+
 
 @dataclass
 class Frame:
@@ -83,10 +118,7 @@ class VoiceActivityDetector:
                 ring_buffer.append((frame, is_speech))
                 num_unvoiced = len([f for f, speech in ring_buffer if not speech])
 
-                if (
-                    num_unvoiced
-                    > self.rate_unvoiced_frames_threshold * ring_buffer.maxlen
-                ):
+                if num_unvoiced > self.rate_unvoiced_frames_threshold * ring_buffer.maxlen:
                     triggered = False
                     ring_buffer.clear()
                     end_second = frame.timestamp
@@ -100,7 +132,6 @@ class VoiceActivityDetector:
         return start_second, end_second
 
 
-
 def silero_vad_collector(
     path: str,
     threshold: float = 0.5,
@@ -110,25 +141,24 @@ def silero_vad_collector(
     speech_pad_ms: int = 30,
 ) -> tuple[float, float]:
 
-    audio = read_audio(path)
+    audio = _waveform(path)
 
     # Get speech timestamps
     speech_timestamps = get_speech_timestamps(
         audio,
-        SILERO_MODEL,
+        get_vad_model(),
         threshold=threshold,
         min_speech_duration_ms=min_speech_duration_ms,
         min_silence_duration_ms=min_silence_duration_ms,
-        window_size_samples=window_size_samples,
         speech_pad_ms=speech_pad_ms,
-        return_seconds=True,
+        return_seconds=False,
     )
 
     if not speech_timestamps:
         return 0.0, 0.0
 
-    start_second = speech_timestamps[0]["start"]
-    end_second = speech_timestamps[-1]["end"]
+    start_second = speech_timestamps[0]["start"] / 16000
+    end_second = speech_timestamps[-1]["end"] / 16000
 
     return start_second, end_second
 
@@ -141,23 +171,21 @@ def silero_speech_ratio(
     window_size_samples: int = 1024,
     speech_pad_ms: int = 30,
 ) -> float:
-    audio = read_audio(path)
+    audio = _waveform(path)
     if len(audio) == 0:
         return 0.0
 
     speech_timestamps = get_speech_timestamps(
         audio,
-        SILERO_MODEL,
+        get_vad_model(),
         threshold=threshold,
         min_speech_duration_ms=min_speech_duration_ms,
         min_silence_duration_ms=min_silence_duration_ms,
-        window_size_samples=window_size_samples,
         speech_pad_ms=speech_pad_ms,
         return_seconds=False,
     )
 
     speech_samples = sum(
-        max(0, timestamp["end"] - timestamp["start"])
-        for timestamp in speech_timestamps
+        max(0, timestamp["end"] - timestamp["start"]) for timestamp in speech_timestamps
     )
     return speech_samples / len(audio)

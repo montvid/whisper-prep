@@ -7,6 +7,7 @@
 # Output structure: out_folder_base/dataset_name/split_name
 dataset_name: common_voice_fused
 split_name: train
+language: de  # Set the language of your input transcripts.
 out_folder_base: ./datasets
 
 # ============================================================================
@@ -56,8 +57,9 @@ maintain_speaker_chance: 0.6
 #   - 32 samples: ~2 minutes
 n_samples_per_srt: 16
 
-# Apply text normalization (removes URLs, extra spaces, etc.)
-normalize_text: true
+# Optional conservative Unicode/whitespace cleanup; preserves spoken text.
+normalize_text: false
+# normalizer_language: de-CH  # Explicit Swiss German expansion, if appropriate.
 
 # Probability (0-1) of applying VAD to each input sentence clip.
 # 1.0 = always trim/position by detected speech, 0.5 = only half the clips,
@@ -120,3 +122,10 @@ filter_english: false
 upload_to_hu: false
 # hu_repo: "username/common_voice_fused"
 # hu_private: true
+
+# Reproducibility, rerun and failure behavior (full reference: docs/configuration.md)
+seed: 42
+n_jobs: 1
+overwrite_output: false
+max_error_rate: 0.0
+min_text_words: 8

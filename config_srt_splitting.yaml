@@ -7,6 +7,7 @@
 # Output structure: out_folder_base/dataset_name/split_name
 dataset_name: long_form_transcripts
 split_name: train
+language: de  # Fallback when a mapping row omits language.
 out_folder_base: ./datasets
 
 # ============================================================================
@@ -110,8 +111,8 @@ filter_words: ["[MUSIC]", "[APPLAUSE]", "[SOUND EFFECTS]"]
 #   │           ├── 0.mp3
 #   │           └── ...
 #   ├── hf/                            (HuggingFace format)
-#   ├── bad_examples.csv               (filtered problematic samples)
-#   └── filtered_*.csv                 (filtered by keywords)
+#   ├── bad_examples.tsv               (filtered problematic samples)
+#   └── filtered_*_segments.tsv                 (filtered by keywords)
 
 # Convert to HuggingFace dataset format (automatic)
 
@@ -131,7 +132,14 @@ upload_to_hu: false
 # ./subtitles/audiobook.vtt  ./audio/audiobook.mp3        de        audiobook_001
 #
 # Columns:
-#   - srt_path: Path to SRT or VTT file (relative or absolute)
-#   - audio_path: Path to corresponding audio file (MP3, WAV, etc.)
+#   - srt_path: Path to SRT or VTT file (relative to this TSV, or absolute)
+#   - audio_path: Path to audio file (relative to this TSV, or absolute)
 #   - language: ISO 639-1 language code (de, en, fr, etc.)
 #   - id: Unique identifier (used for output folder names)
+
+# Reproducibility, rerun and failure behavior (full reference: docs/configuration.md)
+seed: 42
+n_jobs: 1
+overwrite_output: false
+max_error_rate: 0.0
+min_text_words: 8

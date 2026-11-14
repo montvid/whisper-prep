@@ -1,0 +1,56 @@
+name: Tests and packaging
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      hub:
+        description: Run the 11 public Hugging Face integration tests
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    env:
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMBA_NUM_THREADS: '1'
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: '1'
+      HF_HUB_DISABLE_PROGRESS_BARS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install FFmpeg and CPU dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install 'torch==2.10.0' 'torchaudio==2.10.0' --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[dev]'
+          python -m pip check
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Tests
+        run: python -m pytest -m 'not hub' -ra
+      - name: Public Hub integration tests
+        if: github.event_name == 'workflow_dispatch' && inputs.hub
+        run: python -m pytest -m hub tests/test_hub_datasets.py -ra
+      - name: Build and check distributions
+        run: |
+          check-manifest
+          python -m build
+          python -m twine check dist/*

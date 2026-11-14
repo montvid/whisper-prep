@@ -1,12 +1,14 @@
-import html
+import csv
+import inspect
 import json
+import logging
 import os
 import random
 import re
 import unicodedata
 import warnings
-from collections import deque
-from multiprocessing import Pool
+from collections import Counter, defaultdict, deque
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Deque, List, Optional, Union
 
@@ -16,53 +18,39 @@ from tqdm import tqdm
 from whisper.audio import load_audio
 from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE, get_tokenizer
 from whisper.utils import format_timestamp
+
 from whisper_prep.audio.vad import silero_speech_ratio
 from whisper_prep.generation.typing import PromptNode, Record, Utterance
-import csv
-from collections import defaultdict
+from whisper_prep.subtitling.parse import milliseconds, read_cues
+from whisper_prep.text import (
+    clean_subtitle_markup,
+    drop_text_fragments,
+    report_name,
+    resolve_path,
+    sanitize_example_id,
+)
 
 DURATION = 30000  # 30 seconds in milliseconds
 SAMPLE_RATE = 16000
 DURATION_IN_SAMPLES = int(DURATION * SAMPLE_RATE / 1000)
 _WORKER_PROCESSOR = None
-_WORKER_OUTPUT = None
+LOGGER = logging.getLogger(__name__)
+AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".aiff", ".aif", ".wma"}
 
 
-def _init_transcripts_worker(processor_kwargs: dict, output_dir: str) -> None:
-    global _WORKER_PROCESSOR, _WORKER_OUTPUT
+def _init_transcripts_worker(processor_kwargs: dict) -> None:
+    global _WORKER_PROCESSOR
     torch.set_num_threads(1)
-    worker_output = Path(output_dir, f"data.worker.{os.getpid()}.ljson")
-    worker_output.unlink(missing_ok=True)
-    worker_kwargs = dict(processor_kwargs)
-    worker_kwargs["output"] = str(worker_output)
-    _WORKER_OUTPUT = worker_output
-    _WORKER_PROCESSOR = DataProcessor(**worker_kwargs)
+    kwargs = dict(processor_kwargs)
+    # Workers return metadata to the parent; no shard files are created.
+    kwargs["output"] = f"{kwargs['output']}.worker-{os.getpid()}"
+    _WORKER_PROCESSOR = DataProcessor(**kwargs)
 
 
 def _process_transcripts_tsv_row(row: dict) -> dict:
-    if _WORKER_PROCESSOR is None or _WORKER_OUTPUT is None:
+    if _WORKER_PROCESSOR is None:
         raise RuntimeError("Transcript worker was not initialized")
-
-    before_size = _WORKER_OUTPUT.stat().st_size if _WORKER_OUTPUT.exists() else 0
-    filtered_records, error = _WORKER_PROCESSOR._process_transcripts_tsv_row(row)
-    records_written = 0
-    if _WORKER_OUTPUT.exists():
-        with _WORKER_OUTPUT.open(encoding="utf-8") as f:
-            f.seek(before_size)
-            records_written = sum(1 for _ in f)
-
-    return {
-        "records_written": records_written,
-        "filtered_records": filtered_records,
-        "error": error,
-    }
-
-
-def _process_audio_path_worker(audio_path_str: str) -> dict:
-    """Pool worker for the folder-based (SRT-on-disk) timestamping path."""
-    if _WORKER_PROCESSOR is None or _WORKER_OUTPUT is None:
-        raise RuntimeError("Folder worker was not initialized")
-    return _WORKER_PROCESSOR._process_one_audio(Path(audio_path_str))
+    return _WORKER_PROCESSOR._process_row(row)
 
 
 class DataProcessor:
@@ -72,10 +60,7 @@ class DataProcessor:
         transcript_dir: str,
         with_timestamps: bool = True,
         data_file: Optional[str] = None,
-        transcript_formats: List[str] = [
-            "{id}.srt",
-            "{id}.vtt",
-        ],
+        transcript_formats: Optional[List[str]] = None,
         language: str = "de",
         output: str = "data.json",
         dump_dir: str = "dump",
@@ -94,12 +79,14 @@ class DataProcessor:
         validate_empty_with_vad: bool = False,
         empty_vad_max_speech_ratio: float = 0.06,
         n_jobs: int = 1,
+        seed: int = 42,
+        max_error_rate: float = 0.0,
     ) -> None:
         self.with_timestamps = with_timestamps
         self.audio_dir = audio_dir
         self.transcript_dir = transcript_dir
         self.data_file = data_file
-        self.transcript_formats = transcript_formats
+        self.transcript_formats = list(transcript_formats or ["{id}.srt", "{id}.vtt"])
         self.language = language
         self.output = output
         self.dump_dir = dump_dir
@@ -118,13 +105,15 @@ class DataProcessor:
         self.validate_empty_with_vad = validate_empty_with_vad
         self.empty_vad_max_speech_ratio = empty_vad_max_speech_ratio
         self.n_jobs = n_jobs
+        self.seed = seed
+        self.max_error_rate = max_error_rate
+        self.rng = random.Random(seed)
+        self.stats = Counter()
         self.filtered_segment_records: List[dict] = []
 
         self._verify_args()
 
-        self.tokenizer = get_tokenizer(
-            multilingual=(self.tokenizer_type == "multilingual")
-        )
+        self.tokenizer = get_tokenizer(multilingual=(self.tokenizer_type == "multilingual"))
         Path(self.dump_dir).mkdir(parents=True, exist_ok=True)
 
     def _verify_args(self) -> None:
@@ -134,16 +123,14 @@ class DataProcessor:
                     raise ValueError(
                         "`audio_dir` and `transcript_dir` must be set when `with_timestamps` is True and no transcripts_tsv provided"
                     )
-            if self.timestamp_resolution % 20 != 0:
+            if self.timestamp_resolution <= 0 or self.timestamp_resolution % 20 != 0:
                 raise ValueError(
                     "`timestamps_resolution` must be multiples of 20ms. "
                     f"Got {self.timestamp_resolution}"
                 )
         else:
             if not self.data_file:
-                raise ValueError(
-                    "`data_file` must be set when `with_timestamps` is False"
-                )
+                raise ValueError("`data_file` must be set when `with_timestamps` is False")
 
         if self.language not in LANGUAGES:
             if self.language in TO_LANGUAGE_CODE:
@@ -168,25 +155,40 @@ class DataProcessor:
                 f"got {self.empty_vad_max_speech_ratio}"
             )
 
+        if self.max_tokens_length < 3 or self.max_prompt_length < 0:
+            raise ValueError("max_tokens_length must be >= 3 and max_prompt_length >= 0")
+        if self.rep_threshold < 2 or self.subsampling_factor_for_silence < 1:
+            raise ValueError("rep_threshold must be >= 2 and subsampling_factor_for_silence >= 1")
+        if not 0 <= self.max_error_rate <= 1:
+            raise ValueError("max_error_rate must be between 0 and 1")
         if self.n_jobs < 1:
             raise ValueError(f"n_jobs must be at least 1, got {self.n_jobs}")
 
     def run(self) -> None:
-        if self.with_timestamps:
-            self._process_with_timestamps()
-        else:
-            self._process_without_timestamps()
-
-        self._write_filtered_segments()
-
-        if self.subsampling_factor_for_silence > 1:
-            self._subsample_silence()
+        try:
+            if self.with_timestamps:
+                self._process_with_timestamps()
+            else:
+                self._process_without_timestamps()
+            if self.subsampling_factor_for_silence > 1:
+                self._subsample_silence()
+        finally:
+            self._write_filtered_segments()
+            summary_path = Path(self.output).with_suffix(".summary.json")
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(json.dumps(dict(self.stats), indent=2) + "\n", encoding="utf-8")
+        LOGGER.info("Processing totals: %s", dict(self.stats))
+        if self.stats["failed_files"] / max(1, self.stats["files"]) > self.max_error_rate:
+            raise RuntimeError(
+                f"Failed to process {self.stats['failed_files']}/{self.stats['files']} files; "
+                f"see {Path(self.output).with_suffix('.errors.json')}"
+            )
 
     def _process_without_timestamps(self) -> None:
         records = []
         with open(self.data_file, encoding="utf-8") as f:
             for line in f:
-                audio_path, text = line.strip().split("\t")
+                audio_path, text = line.rstrip("\n").split("\t", 1)
                 if self.normalize_unicode:
                     text = unicodedata.normalize("NFKC", text)
 
@@ -198,18 +200,10 @@ class DataProcessor:
                     )
                     continue
 
-                record = Record(
-                    audio_path=audio_path, text=text, language=self.language
-                )
+                record = Record(audio_path=audio_path, text=text, language=self.language)
                 records.append(record)
 
         self.write_records(records, self.output)
-
-    def _drop_repeated_utterances(
-        self, utterances: List[Utterance], threshold: int = 3
-    ) -> List[Utterance]:
-        kept, _ = self._drop_repeated_utterances_with_records(utterances, threshold)
-        return kept
 
     def _drop_repeated_utterances_with_records(
         self, utterances: List[Utterance], threshold: int = 3
@@ -258,9 +252,7 @@ class DataProcessor:
 
         return result_utterances, dropped_records
 
-    def _drop_single_letter_utterance(
-        self, utterances: List[Utterance]
-    ) -> List[Utterance]:
+    def _drop_single_letter_utterance(self, utterances: List[Utterance]) -> List[Utterance]:
         sanitized_utterances = []
         for utterance in utterances:
             if len(utterance.text.strip()) > 0:
@@ -296,590 +288,237 @@ class DataProcessor:
         return kept, dropped_records
 
     def _sanitize_utterances(
-        self,
-        utterances: List[Utterance],
-        filtered_out: Optional[List[dict]] = None,
-        source_id: Optional[str] = None,
-        transcript_path: Optional[Union[str, Path]] = None,
+        self, utterances, filtered_out=None, source_id=None, transcript_path=None
     ) -> List[Utterance]:
-        if not utterances:
-            return []
-
-        # Remove duplicate hallucinations
-        utterances, dropped_repeats = self._drop_repeated_utterances_with_records(
-            utterances
-        )
-        if filtered_out is not None:
-            for record in dropped_repeats:
+        filtered_out = filtered_out if filtered_out is not None else []
+        valid = []
+        for cue in utterances:
+            if cue.start is None or cue.end is None or cue.start < 0 or cue.start >= cue.end:
                 filtered_out.append(
                     {
-                        "speech_id": source_id
-                        or (Path(transcript_path).stem if transcript_path else ""),
+                        "speech_id": source_id or "",
                         "transcript_path": str(transcript_path or ""),
-                        **record,
+                        "start_ms": max(0, min(cue.start or 0, cue.end or 0)),
+                        "end_ms": max(cue.start or 0, cue.end or 0),
+                        "text": cue.text,
+                        "matched_word": "invalid_timestamps",
                     }
                 )
-
-        utterances, dropped_punctuation = (
-            self._drop_punctuation_hallucinations_with_records(utterances)
-        )
-        if filtered_out is not None:
-            for record in dropped_punctuation:
-                filtered_out.append(
-                    {
-                        "speech_id": source_id
-                        or (Path(transcript_path).stem if transcript_path else ""),
-                        "transcript_path": str(transcript_path or ""),
-                        **record,
-                    }
-                )
-
-        # Drop single letter predictions
-        utterances = self._drop_single_letter_utterance(utterances)
-
-        # Add dummy utterances for easier logic
-        utterances.append(Utterance(text=None, start=9999999999999, end=99999999999999))
-        utterances.insert(0, Utterance(text=None, start=-100, end=-99))
-
-        # Sort utterances by start time first
-        utterances.sort(key=lambda u: u.start if u.start is not None else 0)
-
-        sanitized_utterances = []
-
-        for i, _ in enumerate(utterances):
-            current = utterances[i]
-            # Handle cases where the start time is invalid with respect to the end time
-            if current.start >= current.end:
-                # Check if it should be added to the one before or after
-                previous_range = range(
-                    utterances[i - 1].start, utterances[i - 1].end + 1
-                )
-                if current.start in previous_range or current.end in previous_range:
-                    # Add to the previous.
-                    sanitized_utterances[-1] = Utterance(
-                        text=sanitized_utterances[-1].text + " " + current.text,
-                        start=min(sanitized_utterances[-1].start, current.start),
-                        end=max(sanitized_utterances[-1].end, current.end),
-                    )
+                continue
+            if cue.text and cue.text.strip():
+                valid.append(Utterance(cue.text, cue.start, cue.end))
+        valid.sort(key=lambda cue: (cue.start, cue.end))
+        valid, repeats = self._drop_repeated_utterances_with_records(valid, self.rep_threshold)
+        valid, punctuation = self._drop_punctuation_hallucinations_with_records(valid)
+        for record in repeats + punctuation:
+            filtered_out.append(
+                {
+                    "speech_id": source_id or "",
+                    "transcript_path": str(transcript_path or ""),
+                    **record,
+                }
+            )
+        repaired = []
+        for cue in valid:
+            if repaired and repaired[-1].end > cue.start:
+                previous = repaired[-1]
+                self.stats["repaired_overlaps"] += 1
+                if previous.start < cue.start and previous.end - cue.start <= 500:
+                    previous.end = cue.start
                 else:
-                    # If this utterance is after the previous, add it to the following one.
-                    utterances[i + 1] = Utterance(
-                        text=current.text + " " + utterances[i + 1].text,
-                        start=min(utterances[i + 1].start, current.start),
-                        end=max(utterances[i + 1].end, current.end),
-                    )
-            else:
-                sanitized_utterances.append(current)
-            # Update end before.
-        sanitized_utterances.pop()
-        sanitized_utterances.pop(0)
+                    # Simultaneous/nested cues cannot have monotone timestamps;
+                    # retain both texts inside their combined audio interval.
+                    previous.text += " " + cue.text
+                    previous.end = max(previous.end, cue.end)
+                    continue
+            repaired.append(cue)
+        return repaired
 
-        # Remove duplicate hallucinations, which happen often when transcribi
-        return sanitized_utterances
+    @staticmethod
+    def _language_code(value):
+        value = TO_LANGUAGE_CODE.get(value, value)
+        if value not in LANGUAGES:
+            raise ValueError(f"Unsupported language: {value}")
+        return value
+
+    def _input_rows(self):
+        if self.transcripts_tsv:
+            base = Path(self.transcripts_tsv).resolve().parent
+            with open(self.transcripts_tsv, encoding="utf-8-sig", newline="") as stream:
+                reader = csv.DictReader(stream, delimiter="\t", strict=True)
+                if not {"audio_path", "srt_path"}.issubset(reader.fieldnames or []):
+                    raise ValueError("transcripts_tsv requires audio_path and srt_path columns")
+                rows = list(reader)
+        else:
+            base = Path.cwd()
+            rows = []
+            for audio in sorted(Path(self.audio_dir).iterdir()):
+                if not audio.is_file() or audio.suffix.lower() not in AUDIO_SUFFIXES:
+                    continue
+                transcripts = [
+                    Path(self.transcript_dir) / fmt.format(id=audio.stem)
+                    for fmt in self.transcript_formats
+                ]
+                transcript = next((path for path in transcripts if path.is_file()), transcripts[0])
+                rows.append(
+                    {
+                        "id": audio.stem,
+                        "audio_path": str(audio.resolve()),
+                        "srt_path": str(transcript.resolve()),
+                    }
+                )
+        seen = {}
+        for row in rows:
+            if not row.get("audio_path") or not row.get("srt_path") or None in row:
+                raise ValueError("Invalid row in transcripts_tsv")
+            row["audio_path"] = str(resolve_path(row["audio_path"], base))
+            row["srt_path"] = str(resolve_path(row["srt_path"], base))
+            raw_id = row.get("id") or Path(row["audio_path"]).stem
+            row["id"] = sanitize_example_id(raw_id)
+            if row["id"] in seen:
+                raise ValueError(
+                    f"Duplicate output id {row['id']!r}: {seen[row['id']]} and {row['audio_path']}"
+                )
+            seen[row["id"]] = row["audio_path"]
+            row["language"] = self._language_code(row.get("language") or self.language)
+        return rows
+
+    def _processor_kwargs(self):
+        kwargs = {name: getattr(self, name) for name in inspect.signature(type(self)).parameters}
+        kwargs.update(n_jobs=1, subsampling_factor_for_silence=1)
+        return kwargs
 
     def _process_with_timestamps(self) -> None:
-        if self.transcripts_tsv:
-            if self.n_jobs > 1:
-                self._process_transcripts_tsv_parallel()
-                return
-            self._process_transcripts_tsv_sequential()
-            return
-        audio_paths = list(Path(self.audio_dir).iterdir())
+        rows = self._input_rows()  # Validate IDs/languages before writing any audio.
+        Path(self.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.output).touch()
+        if self.n_jobs > 1 and rows:
+            with get_context("spawn").Pool(
+                min(self.n_jobs, len(rows)),
+                initializer=_init_transcripts_worker,
+                initargs=(self._processor_kwargs(),),
+            ) as pool:
+                self._consume_results(pool.imap(_process_transcripts_tsv_row, rows), len(rows))
+        else:
+            self._consume_results(map(self._process_row, rows), len(rows))
 
-        # Cutting each generated audio + its SRT into <=30s records is fully
-        # independent per file, so parallelize it when n_jobs > 1.
-        if self.n_jobs > 1 and len(audio_paths) > 1:
-            self._process_folder_parallel(audio_paths)
-            return
-
-        for audio_path in tqdm(audio_paths):
-            result = self._process_one_audio(audio_path)
-            self.filtered_segment_records.extend(result["filtered_records"])
+    def _consume_results(self, results, total):
+        summary = Counter(files=total)
+        filtered = []
+        errors = []
+        for result in tqdm(results, total=total, desc="Processing audio and subtitles"):
+            summary.update(result["stats"])
+            filtered.extend(result["filtered_records"])
             if result["error"]:
-                print(result["error"])
-
-    def _process_one_audio(self, audio_path: Path) -> dict:
-        """Process a single generated audio file and its transcript.
-
-        Reads the matching SRT/VTT, creates timestamped records and appends
-        them to ``self.output``. Returns the filtered-segment records plus an
-        optional error string (instead of raising) so it is safe to call from
-        a multiprocessing pool worker.
-        """
-        speech_id = audio_path.stem
-
-        for fmt in self.transcript_formats:
-            transcript_path = Path(self.transcript_dir) / fmt.format(id=speech_id)
-            if not transcript_path.exists():
-                continue
-            try:
-                filtered_for_speech: List[dict] = []
-                if transcript_path.suffix == ".srt":
-                    utterances_for_speech = self.read_utterances_from_srt(
-                        transcript_path,
-                        self.normalize_unicode,
-                        self.filter_segment_words,
-                        self.drop_text,
-                        filtered_for_speech,
-                        speech_id,
-                    )
-                elif transcript_path.suffix == ".vtt":
-                    utterances_for_speech = self.read_utterances_from_vtt(
-                        transcript_path,
-                        self.normalize_unicode,
-                        self.filter_segment_words,
-                        self.drop_text,
-                        filtered_for_speech,
-                        speech_id,
-                    )
-                else:
-                    continue
-                # Sanitize utterances, if necessary. Takes care of some random
-                # timestamp errors produced by the VAD of whisperx.
-                if not self._is_valid_utterances(utterances_for_speech, 0):
-                    utterances_for_speech = self._sanitize_utterances(
-                        utterances_for_speech,
-                        filtered_for_speech,
-                        speech_id,
-                        transcript_path,
-                    )
-                blocked_intervals = [
-                    (r["start_ms"], r["end_ms"]) for r in filtered_for_speech
-                ]
-                records = self._create_records_with_timestamps(
-                    utterances_for_speech,
-                    audio_path,
-                    speech_id,
-                    blocked_intervals=blocked_intervals,
-                )
-                self.write_records(records, self.output)
-                return {"filtered_records": filtered_for_speech, "error": None}
-            except Exception as e:
-                return {
-                    "filtered_records": [],
-                    "error": (
-                        f"Skipping {transcript_path} due to an error in the "
-                        f"transcript: {e}"
-                    ),
-                }
-
-        return {
-            "filtered_records": [],
-            "error": f"Transcript file not found for {speech_id}",
-        }
-
-    def _process_folder_parallel(self, audio_paths: List[Path]) -> None:
-        """Parallel version of the folder-based timestamping path.
-
-        Mirrors :meth:`_process_transcripts_tsv_parallel`: each worker owns its
-        own output shard, then the shards are concatenated into ``self.output``.
-        """
-        parts_dir = Path(self.output).parent / "_parts"
-        parts_dir.mkdir(parents=True, exist_ok=True)
-        for part_path in parts_dir.glob("data.worker.*.ljson"):
-            part_path.unlink()
-
-        processor_kwargs = {
-            "audio_dir": self.audio_dir,
-            "transcript_dir": self.transcript_dir,
-            "with_timestamps": self.with_timestamps,
-            "data_file": self.data_file,
-            "transcript_formats": self.transcript_formats,
-            "language": self.language,
-            "dump_dir": self.dump_dir,
-            "timestamp_resolution": self.timestamp_resolution,
-            "max_prompt_length": self.max_prompt_length,
-            "max_tokens_length": self.max_tokens_length,
-            "subsampling_factor_for_silence": 1,
-            "keep_empty_chance": self.keep_empty_chance,
-            "rep_threshold": self.rep_threshold,
-            "tokenizer_type": self.tokenizer_type,
-            "normalize_unicode": self.normalize_unicode,
-            "cut_initial_audio": self.cut_initial_audio,
-            "filter_segment_words": self.filter_segment_words,
-            "drop_text": self.drop_text,
-            "transcripts_tsv": None,
-            "validate_empty_with_vad": self.validate_empty_with_vad,
-            "empty_vad_max_speech_ratio": self.empty_vad_max_speech_ratio,
-            "n_jobs": 1,
-        }
-        worker_count = min(self.n_jobs, len(audio_paths))
-        print(f"Cutting {len(audio_paths)} SRTs into segments with {worker_count} workers")
-
-        audio_path_strs = [str(p) for p in audio_paths]
-        with Pool(
-            processes=worker_count,
-            initializer=_init_transcripts_worker,
-            initargs=(processor_kwargs, str(parts_dir)),
-        ) as pool:
-            for result in tqdm(
-                pool.imap_unordered(_process_audio_path_worker, audio_path_strs),
-                total=len(audio_path_strs),
-                desc="Cutting SRTs into segments",
-            ):
-                self.filtered_segment_records.extend(result["filtered_records"])
-                if result["error"]:
-                    print(result["error"])
-
-        Path(self.output).unlink(missing_ok=True)
-        with open(self.output, "w", encoding="utf-8") as outfile:
-            for part_path in sorted(parts_dir.glob("data.worker.*.ljson")):
-                with part_path.open(encoding="utf-8") as infile:
-                    for line in infile:
-                        outfile.write(line)
-
-    def _process_transcripts_tsv_sequential(self) -> None:
-        if self.transcripts_tsv:
-            with open(self.transcripts_tsv, encoding="utf-8") as tsvfile:
-                # Pre-count rows so tqdm can display ETA and progress percentage.
-                total_rows = max(0, sum(1 for _ in tsvfile) - 1)
-                tsvfile.seek(0)
-                reader = csv.DictReader(tsvfile, delimiter="\t")
-                for row in tqdm(
-                    reader,
-                    total=total_rows,
-                    desc="Processing TSV transcripts",
-                ):
-                    srt_path = Path(row["srt_path"])
-                    audio_path = Path(row["audio_path"])
-                    speech_id = row.get("id") or audio_path.stem
-                    orig_lang = self.language
-                    self.language = row.get("language") or self.language
-                    filtered_for_speech: List[dict] = []
-                    try:
-                        if srt_path.suffix == ".srt":
-                            utterances = self.read_utterances_from_srt(
-                                srt_path,
-                                self.normalize_unicode,
-                                self.filter_segment_words,
-                                self.drop_text,
-                                filtered_for_speech,
-                                speech_id,
-                            )
-                        elif srt_path.suffix == ".vtt":
-                            utterances = self.read_utterances_from_vtt(
-                                srt_path,
-                                self.normalize_unicode,
-                                self.filter_segment_words,
-                                self.drop_text,
-                                filtered_for_speech,
-                                speech_id,
-                            )
-                        else:
-                            raise ValueError(
-                                f"Unsupported transcript format: {srt_path.suffix}"
-                            )
-                        if not self._is_valid_utterances(utterances, 0):
-                            utterances = self._sanitize_utterances(
-                                utterances,
-                                filtered_for_speech,
-                                speech_id,
-                                srt_path,
-                            )
-                        blocked_intervals = [
-                            (r["start_ms"], r["end_ms"]) for r in filtered_for_speech
-                        ]
-                        self.filtered_segment_records.extend(filtered_for_speech)
-                        records = self._create_records_with_timestamps(
-                            utterances,
-                            audio_path,
-                            speech_id,
-                            blocked_intervals=blocked_intervals,
-                        )
-                        self.write_records(records, self.output)
-                    except Exception as e:
-                        print(e)
-                        print(f"Skipping {srt_path} due to an error in the transcript")
-                    finally:
-                        self.language = orig_lang
-            return
-
-    def _process_transcripts_tsv_parallel(self) -> None:
-        if not self.transcripts_tsv:
-            return
-
-        with open(self.transcripts_tsv, encoding="utf-8") as tsvfile:
-            rows = list(csv.DictReader(tsvfile, delimiter="\t"))
-
-        parts_dir = Path(self.output).parent / "_parts"
-        parts_dir.mkdir(parents=True, exist_ok=True)
-        for part_path in parts_dir.glob("data.worker.*.ljson"):
-            part_path.unlink()
-
-        processor_kwargs = {
-            "audio_dir": self.audio_dir,
-            "transcript_dir": self.transcript_dir,
-            "with_timestamps": self.with_timestamps,
-            "data_file": self.data_file,
-            "transcript_formats": self.transcript_formats,
-            "language": self.language,
-            "dump_dir": self.dump_dir,
-            "timestamp_resolution": self.timestamp_resolution,
-            "max_prompt_length": self.max_prompt_length,
-            "max_tokens_length": self.max_tokens_length,
-            "subsampling_factor_for_silence": 1,
-            "keep_empty_chance": self.keep_empty_chance,
-            "rep_threshold": self.rep_threshold,
-            "tokenizer_type": self.tokenizer_type,
-            "normalize_unicode": self.normalize_unicode,
-            "cut_initial_audio": self.cut_initial_audio,
-            "filter_segment_words": self.filter_segment_words,
-            "drop_text": self.drop_text,
-            "transcripts_tsv": self.transcripts_tsv,
-            "validate_empty_with_vad": self.validate_empty_with_vad,
-            "empty_vad_max_speech_ratio": self.empty_vad_max_speech_ratio,
-            "n_jobs": 1,
-        }
-        worker_count = min(self.n_jobs, len(rows))
-        print(f"Processing TSV transcripts with {worker_count} workers")
-
-        with Pool(
-            processes=worker_count,
-            initializer=_init_transcripts_worker,
-            initargs=(processor_kwargs, str(parts_dir)),
-        ) as pool:
-            for result in tqdm(
-                pool.imap_unordered(_process_transcripts_tsv_row, rows),
-                total=len(rows),
-                desc="Processing TSV transcripts",
-            ):
-                self.filtered_segment_records.extend(result["filtered_records"])
-                if result["error"]:
-                    print(result["error"])
-
-        Path(self.output).unlink(missing_ok=True)
-        with open(self.output, "w", encoding="utf-8") as outfile:
-            for part_path in sorted(parts_dir.glob("data.worker.*.ljson")):
-                with part_path.open(encoding="utf-8") as infile:
-                    for line in infile:
-                        outfile.write(line)
-
-    def _process_transcripts_tsv_row(self, row: dict) -> tuple[List[dict], Optional[str]]:
-        srt_path = Path(row["srt_path"])
-        audio_path = Path(row["audio_path"])
-        speech_id = row.get("id") or audio_path.stem
-        orig_lang = self.language
-        self.language = row.get("language") or self.language
-        filtered_for_speech: List[dict] = []
-        try:
-            if srt_path.suffix == ".srt":
-                utterances = self.read_utterances_from_srt(
-                    srt_path,
-                    self.normalize_unicode,
-                    self.filter_segment_words,
-                    self.drop_text,
-                    filtered_for_speech,
-                    speech_id,
-                )
-            elif srt_path.suffix == ".vtt":
-                utterances = self.read_utterances_from_vtt(
-                    srt_path,
-                    self.normalize_unicode,
-                    self.filter_segment_words,
-                    self.drop_text,
-                    filtered_for_speech,
-                    speech_id,
-                )
+                errors.append(result["error"])
+                summary["failed_files"] += 1
             else:
-                raise ValueError(f"Unsupported transcript format: {srt_path.suffix}")
-            if not self._is_valid_utterances(utterances, 0):
-                utterances = self._sanitize_utterances(
-                    utterances,
-                    filtered_for_speech,
-                    speech_id,
-                    srt_path,
-                )
-            blocked_intervals = [
-                (r["start_ms"], r["end_ms"]) for r in filtered_for_speech
-            ]
+                self.write_records(result["records"], self.output)
+                summary["output_records"] += len(result["records"])
+        self.stats = summary
+        self.filtered_segment_records = filtered
+        if errors:
+            Path(self.output).with_suffix(".errors.json").write_text(
+                json.dumps(errors, indent=2) + "\n", encoding="utf-8"
+            )
+
+    def _process_row(self, row):
+        original_language = self.language
+        self.language = row["language"]
+        self.rng = random.Random(f"{self.seed}:{row['id']}")
+        self.stats = Counter()
+        self.filtered_segment_records = []
+        records, error = [], None
+        try:
+            transcript = Path(row["srt_path"])
+            if transcript.suffix.lower() not in {".srt", ".vtt"}:
+                raise ValueError(f"Unsupported transcript format: {transcript.suffix}")
+            cues = self.read_utterances_from_srt(
+                transcript,
+                self.normalize_unicode,
+                self.filter_segment_words,
+                self.drop_text,
+                self.filtered_segment_records,
+                row["id"],
+            )
+            self.stats["input_cues"] = len(cues) + len(self.filtered_segment_records)
+            cues = self._sanitize_utterances(
+                cues, self.filtered_segment_records, row["id"], transcript
+            )
+            blocked = [(r["start_ms"], r["end_ms"]) for r in self.filtered_segment_records]
             records = self._create_records_with_timestamps(
-                utterances,
-                audio_path,
-                speech_id,
-                blocked_intervals=blocked_intervals,
+                cues,
+                Path(row["audio_path"]),
+                row["id"],
+                blocked_intervals=blocked,
             )
-            self.write_records(records, self.output)
-            return filtered_for_speech, None
-        except Exception as e:
-            return (
-                filtered_for_speech,
-                f"{e}\nSkipping {srt_path} due to an error in the transcript",
+        except Exception as exc:
+            LOGGER.exception(
+                "Failed processing audio %s with subtitles %s", row["audio_path"], row["srt_path"]
             )
+            error = {
+                "audio_path": row["audio_path"],
+                "transcript_path": row["srt_path"],
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            # A failed file must not leave segments that look like accepted data.
+            for path in (Path(self.dump_dir) / row["id"]).glob("*.mp3"):
+                path.unlink()
         finally:
-            self.language = orig_lang
+            self.language = original_language
+        self.stats["dropped_cues"] += len(self.filtered_segment_records)
+        for record in self.filtered_segment_records:
+            self.stats["dropped_" + record["matched_word"]] += 1
+        return {
+            "records": records,
+            "filtered_records": self.filtered_segment_records,
+            "error": error,
+            "stats": dict(self.stats),
+        }
 
     @staticmethod
     def read_utterances_from_srt(
-        transcript_path: Union[str, Path],
-        normalize_unicode: bool = False,
-        filter_segment_words: Optional[List[str]] = None,
-        drop_text: Optional[List[str]] = None,
-        filtered_out: Optional[List[dict]] = None,
-        source_id: Optional[str] = None,
+        transcript_path,
+        normalize_unicode=False,
+        filter_segment_words=None,
+        drop_text=None,
+        filtered_out=None,
+        source_id=None,
     ) -> List[Utterance]:
-        utterances = []
-        with open(transcript_path, encoding="utf-8") as f:
-            lines = f.readlines()
-            timestamps_indices = [i for i, line in enumerate(lines) if " --> " in line]
-            timestamps_indices.append(
-                # +2 so the final cue's text slice reaches the end of the file. With +1
-                # the last line is cut, which silently drops the last subtitle whenever
-                # the file does not end with a blank line.
-                len(lines) + 2
-            )  # a dummy index to make the loop below simple
-
-            for i in range(len(timestamps_indices) - 1):
-                utterance_start = timestamps_indices[i]
-                next_utterance_start = timestamps_indices[i + 1]
-
-                start_time, end_time = DataProcessor._parse_timestamp_line(
-                    lines[utterance_start]
-                )
-
-                # `next_utterance_start - 1` corresponds to an index number of the utterance and
-                # `next_utterance_start - 2` corresponds to a newline character, thus the text is
-                # included between [`utterance_start + 1`, `next_utterance_start - 2`).
-                text = " ".join(
-                    [
-                        line.strip()
-                        for line in lines[
-                            utterance_start + 1 : next_utterance_start - 2
-                        ]
-                    ]
-                ).strip()
-                text = DataProcessor._clean_subtitle_markup(text)
-                if normalize_unicode:
-                    text = unicodedata.normalize("NFKC", text)
-                text = DataProcessor._drop_text_fragments(text, drop_text)
-                if not text:
-                    continue
-                # Skip if single character
-                if len(text) == 1:
-                    continue
-                # Filter out utterances containing specific words, if specified
-                contains_filter_words = False
-                matched_word = None
-                if filter_segment_words is not None:
-                    for word in filter_segment_words:
-                        if word.lower() in text.lower():
-                            contains_filter_words = True
-                            matched_word = word
-                            break
-
-                if contains_filter_words:
-                    if filtered_out is not None:
-                        filtered_out.append(
-                            {
-                                "speech_id": source_id
-                                or Path(transcript_path).stem,
-                                "transcript_path": str(transcript_path),
-                                "start_ms": start_time,
-                                "end_ms": end_time,
-                                "text": text,
-                                "matched_word": matched_word or "",
-                            }
-                        )
-                    continue
-
-                utterances.append(Utterance(text=text, start=start_time, end=end_time))
-
-        return utterances
-
-    @staticmethod
-    def read_utterances_from_vtt(
-        transcript_path: Union[str, Path],
-        normalize_unicode: bool = False,
-        filter_segment_words: Optional[List[str]] = None,
-        drop_text: Optional[List[str]] = None,
-        filtered_out: Optional[List[dict]] = None,
-        source_id: Optional[str] = None,
-    ) -> List[Utterance]:
-        utterances = []
-        with open(transcript_path, encoding="utf-8") as f:
-            lines = f.readlines()
-            timestamps_indices = [i for i, line in enumerate(lines) if " --> " in line]
-            timestamps_indices.append(
-                # +2 so the final cue's text slice reaches the end of the file. With +1
-                # the last line is cut, which silently drops the last subtitle whenever
-                # the file does not end with a blank line.
-                len(lines) + 2
-            )  # a dummy index to make the loop below simple
-
-            for i in range(len(timestamps_indices) - 1):
-                utterance_start = timestamps_indices[i]
-                next_utterance_start = timestamps_indices[i + 1]
-
-                start_time, end_time = DataProcessor._parse_timestamp_line(
-                    lines[utterance_start]
-                )
-
-                # `next_utterance_start - 1` corresponds to a newline, thus the text is included
-                # between [`utterance_start + 1`, `next_utterance_start - 1`).
-                text = " ".join(
-                    [
-                        line.strip()
-                        for line in lines[
-                            utterance_start + 1 : next_utterance_start - 1
-                        ]
-                    ]
-                ).strip()
-                text = DataProcessor._clean_subtitle_markup(text)
-                if normalize_unicode:
-                    text = unicodedata.normalize("NFKC", text)
-                text = DataProcessor._drop_text_fragments(text, drop_text)
-                # Filter out empty utterances
-                if not text:
-                    continue
-                # Skip if single dot
-                if text == ".":
-                    continue
-                # Filter out utterances containing specific words, if specified
-                if filter_segment_words:
-                    matched_word = None
-                    for word in filter_segment_words:
-                        if word.lower() in text.lower():
-                            matched_word = word
-                            break
-                    if matched_word is not None:
-                        if filtered_out is not None:
-                            filtered_out.append(
-                                {
-                                    "speech_id": source_id
-                                    or Path(transcript_path).stem,
-                                    "transcript_path": str(transcript_path),
-                                    "start_ms": start_time,
-                                    "end_ms": end_time,
-                                    "text": text,
-                                    "matched_word": matched_word,
-                                }
-                            )
-                        continue
-
-                utterances.append(Utterance(text=text, start=start_time, end=end_time))
-
-        return utterances
-
-    @staticmethod
-    def _clean_subtitle_markup(text: str) -> str:
-        text = html.unescape(text)
-        text = re.sub(r"</?[^>]+>", "", text)
-        text = re.sub(r"\s+<[^>]*$", "", text)
-        text = re.sub(r"\s{2,}", " ", text)
-        return text.strip()
-
-    @staticmethod
-    def _drop_text_fragments(text: str, drop_text: Optional[List[str]] = None) -> str:
-        if not drop_text:
-            return text
-
-        for fragment in drop_text:
-            if not fragment:
+        kept = []
+        for cue in read_cues(transcript_path):
+            text = unicodedata.normalize("NFKC", cue.text) if normalize_unicode else cue.text
+            text = drop_text_fragments(text, drop_text)
+            if not text:
                 continue
-            text = re.sub(re.escape(fragment), "", text, flags=re.IGNORECASE)
+            word = next(
+                (
+                    word
+                    for word in filter_segment_words or []
+                    if word and word.lower() in text.lower()
+                ),
+                None,
+            )
+            if word is not None:
+                if filtered_out is not None:
+                    filtered_out.append(
+                        {
+                            "speech_id": source_id or Path(transcript_path).stem,
+                            "transcript_path": str(transcript_path),
+                            "start_ms": cue.start,
+                            "end_ms": cue.end,
+                            "text": text,
+                            "matched_word": word,
+                        }
+                    )
+            else:
+                kept.append(Utterance(text, cue.start, cue.end))
+        return kept
 
-        text = re.sub(r"\s+([,.;:!?])", r"\1", text)
-        text = re.sub(r"\s{2,}", " ", text)
-        return text.strip()
+    read_utterances_from_vtt = read_utterances_from_srt
+    _clean_subtitle_markup = staticmethod(clean_subtitle_markup)
+    _drop_text_fragments = staticmethod(drop_text_fragments)
 
     @staticmethod
     def _parse_timestamp_line(line: str) -> tuple[int, int]:
@@ -905,7 +544,7 @@ class DataProcessor:
         for word, records in grouped.items():
             if not records:
                 continue
-            out_path = out_folder / f"filtered_{word}_examples.csv"
+            out_path = out_folder / f"filtered_{report_name(word)}_segments.tsv"
             with open(out_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(
                     f,
@@ -929,11 +568,48 @@ class DataProcessor:
         speech_id: Optional[str] = None,
         blocked_intervals: Optional[List[tuple]] = None,
     ) -> List[Record]:
-        audio = torch.tensor(load_audio(audio_path))
-        dump_dir = Path(self.dump_dir) / (speech_id if speech_id else audio_path.stem)
+        audio = torch.from_numpy(load_audio(audio_path))
+        dump_dir = Path(self.dump_dir) / sanitize_example_id(speech_id or audio_path.stem)
         dump_dir.mkdir(parents=True, exist_ok=True)
         audio_duration_ms = int(audio.size(0) * 1000 / SAMPLE_RATE)
-        safe_spans = self._get_safe_spans(audio_duration_ms, blocked_intervals or [])
+        blocked = list(blocked_intervals or [])
+        prepared = []
+        for cue in sorted(utterances, key=lambda u: u.start):
+            cue = Utterance(cue.text, cue.start, cue.end)
+            reason = None
+            if cue.end > audio_duration_ms:
+                if cue.start < audio_duration_ms and cue.end - audio_duration_ms <= 1000:
+                    LOGGER.warning("Clamping final cue in %s to the audio duration", audio_path)
+                    cue.end = audio_duration_ms
+                    self.stats["clamped_cues"] += 1
+                else:
+                    reason = "outside_audio"
+            if cue.end - cue.start > DURATION:
+                reason = "cue_duration"
+            if (
+                len(self.tokenizer.encode(self._add_leading_space(cue.text))) + 2
+                > self.max_tokens_length
+            ):
+                reason = "cue_token_budget"
+            if any(cue.start < end and cue.end > start for start, end in blocked):
+                reason = "blocked_boundary"
+            if reason:
+                blocked.append((cue.start, cue.end))
+                self.filtered_segment_records.append(
+                    {
+                        "speech_id": speech_id or audio_path.stem,
+                        "transcript_path": "",
+                        "start_ms": cue.start,
+                        "end_ms": cue.end,
+                        "text": cue.text,
+                        "matched_word": reason,
+                    }
+                )
+                LOGGER.warning("Dropping cue from %s (%s): %s", audio_path, reason, cue.text)
+            else:
+                prepared.append(cue)
+        utterances = prepared
+        safe_spans = self._get_safe_spans(audio_duration_ms, blocked)
         records = []
         utterances = sorted(utterances, key=lambda u: u.start)
         span_cursor = 0
@@ -1000,15 +676,32 @@ class DataProcessor:
 
                 segment_utterances = []
                 next_segment_start = None
-                while (
-                    idx < len(span_utterances)
-                    and span_utterances[idx].start < segment_end
-                ):
+                packed_tokens = 0
+                while idx < len(span_utterances) and span_utterances[idx].start < segment_end:
                     if span_utterances[idx].end > segment_end:
                         next_segment_start = span_utterances[idx].start
                         break
+                    cost = (
+                        len(
+                            self.tokenizer.encode(
+                                self._add_leading_space(span_utterances[idx].text)
+                            )
+                        )
+                        + 2
+                    )
+                    # Leave room for the next cue's start timestamp. A single
+                    # cue that exactly fills the budget gets a shorter audio
+                    # window below, without an extra dangling token.
+                    if segment_utterances and packed_tokens + cost + 1 > self.max_tokens_length:
+                        next_segment_start = span_utterances[idx].start
+                        break
                     segment_utterances.append(span_utterances[idx])
+                    packed_tokens += cost
                     idx += 1
+
+                if packed_tokens == self.max_tokens_length and next_segment_start is not None:
+                    segment_end = segment_utterances[-1].end
+                    next_segment_start = None
 
                 if not self._is_valid_utterances(segment_utterances, segment_start):
                     tqdm.write(
@@ -1017,18 +710,17 @@ class DataProcessor:
                         f"utterances: {segment_utterances}"
                     )
                     prompt_buffer.clear()
-                    segment_start = max(segment_end, segment_utterances[-1].end)
+                    self.stats["invalid_windows"] += 1
+                    segment_start = (
+                        next_segment_start if next_segment_start is not None else segment_end
+                    )
                     continue
 
                 tokens_length = 0
                 segment_text = []
                 for utterance in segment_utterances:
-                    start_token = self._get_time_token(
-                        utterance.start, segment_start, audio_path
-                    )
-                    end_token = self._get_time_token(
-                        utterance.end, segment_start, audio_path
-                    )
+                    start_token = self._get_time_token(utterance.start, segment_start, audio_path)
+                    end_token = self._get_time_token(utterance.end, segment_start, audio_path)
                     utterance_text = self._add_leading_space(utterance.text)
                     segment_text.extend([start_token, utterance_text, end_token])
                     new_prompt_length = len(self.tokenizer.encode(utterance_text)) + 2
@@ -1060,7 +752,7 @@ class DataProcessor:
                         f"{format_timestamp(segment_end / 1000)}) because it is too long "
                         f"({tokens_length} tokens)"
                     )
-                elif not segment_utterances and random.random() >= self.keep_empty_chance:
+                elif not segment_utterances and self.rng.random() >= self.keep_empty_chance:
                     pass
                 else:
                     # Always store the full window. Truncating at the last
@@ -1069,11 +761,7 @@ class DataProcessor:
                     segment_audio_path = self._save_segment_audio(
                         audio, segment_start, segment_end, dump_dir
                     )
-                    empty_segment_failed_vad = (
-                        not segment_utterances
-                        and not self._empty_segment_passes_vad(segment_audio_path)
-                    )
-                    if not empty_segment_failed_vad:
+                    if segment_utterances or self._empty_segment_passes_vad(segment_audio_path):
                         record = Record(
                             audio_path=segment_audio_path,
                             language=self.language,
@@ -1112,7 +800,7 @@ class DataProcessor:
             segment_end = min(segment_start + DURATION, span_end)
             if segment_start >= segment_end:
                 break
-            if random.random() < self.keep_empty_chance:
+            if self.rng.random() < self.keep_empty_chance:
                 segment_audio_path = self._save_segment_audio(
                     audio, segment_start, segment_end, dump_dir
                 )
@@ -1134,6 +822,8 @@ class DataProcessor:
         if not self.validate_empty_with_vad:
             return True
 
+        # Validate the actual encoded training audio. MP3 encoding can alter
+        # VAD decisions; checking only the pre-encoding PCM is insufficient.
         speech_ratio = silero_speech_ratio(segment_audio_path)
         if speech_ratio <= self.empty_vad_max_speech_ratio:
             return True
@@ -1143,6 +833,7 @@ class DataProcessor:
             f"{speech_ratio:.2%} speech"
         )
         Path(segment_audio_path).unlink(missing_ok=True)
+        self.stats["vad_rejected_segments"] += 1
         return False
 
     def _save_segment_audio(
@@ -1152,7 +843,9 @@ class DataProcessor:
         audio_end_idx = int(segment_end * SAMPLE_RATE / 1000)
         segment_audio_path = str((dump_dir / f"{segment_start}.mp3").absolute())
         segment_audio = audio[
-            audio_start_idx : min(audio_end_idx, audio_start_idx + DURATION_IN_SAMPLES, audio.size(0))
+            audio_start_idx : min(
+                audio_end_idx, audio_start_idx + DURATION_IN_SAMPLES, audio.size(0)
+            )
         ]
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -1203,9 +896,7 @@ class DataProcessor:
             safe_spans.append((cursor, audio_duration_ms))
         return safe_spans
 
-    def _is_valid_utterances(
-        self, utterances: List[Utterance], segment_start: int
-    ) -> bool:
+    def _is_valid_utterances(self, utterances: List[Utterance], segment_start: int) -> bool:
         if len(utterances) == 0:
             return True
 
@@ -1248,37 +939,7 @@ class DataProcessor:
         else:
             return " " + text
 
-    @staticmethod
-    def str_to_milliseconds(s: str) -> int:
-        """
-        Convert a string in the format of "00:00:00,000" to milliseconds.
-        """
-        if "," in s:
-            time, miliseconds = s.split(",")
-        elif "." in s:
-            time, miliseconds = s.split(".")
-        else:
-            raise ValueError(
-                f"Invalid time format: {s}. Must be in the format of 00:00:00,000 or 00:00:00.000"
-            )
-        parts = time.split(":")
-        if len(parts) == 3:
-            hours, minutes, seconds = parts
-        elif len(parts) == 2:
-            # WebVTT allows the hours field to be omitted, and Whisper's own WriteVTT
-            # emits MM:SS.mmm for anything under an hour (format_timestamp defaults to
-            # always_include_hours=False). Accept both.
-            hours, (minutes, seconds) = 0, parts
-        else:
-            raise ValueError(
-                f"Invalid time format: {s}. Must be HH:MM:SS or MM:SS, "
-                "separated from the milliseconds by ',' or '.'"
-            )
-        hours = int(hours)
-        minutes = int(minutes)
-        seconds = int(seconds)
-        miliseconds = int(miliseconds)
-        return (hours * 3600 + minutes * 60 + seconds) * 1000 + miliseconds
+    str_to_milliseconds = staticmethod(milliseconds)
 
     def _get_time_token(self, time: int, segment_start: int, audio_path: Path) -> str:
         """
@@ -1299,24 +960,18 @@ class DataProcessor:
             )
 
         time_in_segment = time - segment_start
-        nearest_timestamp = (
-            round(time_in_segment / self.timestamp_resolution)
-            * self.timestamp_resolution
-        )  # in milliseconds
+        nearest_timestamp = min(
+            DURATION,
+            (round(time_in_segment / self.timestamp_resolution) * self.timestamp_resolution),
+        )  # in milliseconds; coarse custom resolutions must not exceed 30 s.
         time_token = f"<|{nearest_timestamp / 1000:.2f}|>"
         return time_token
 
     def _get_prompt(self, prompt_buffer: Deque[PromptNode]) -> str:
-        prompt_length = 0
-        prompt_buffer_idx = len(prompt_buffer)
-        while prompt_buffer_idx >= 1 and prompt_length < self.max_prompt_length:
-            prompt_buffer_idx -= 1
-            prompt_length += prompt_buffer[prompt_buffer_idx].num_tokens
-
-        for _ in range(prompt_buffer_idx):
-            prompt_buffer.popleft()
-
-        return "".join([node.text for node in prompt_buffer])
+        prompt_length = sum(node.num_tokens for node in prompt_buffer)
+        while prompt_buffer and prompt_length > self.max_prompt_length:
+            prompt_length -= prompt_buffer.popleft().num_tokens
+        return "".join(node.text for node in prompt_buffer)
 
     @staticmethod
     def read_records(path: Union[str, Path]) -> List[Record]:
@@ -1325,7 +980,7 @@ class DataProcessor:
             for line in f:
                 data = json.loads(line)
                 record = Record(
-                    audio_path=data["audio_path"],
+                    audio_path=str(resolve_path(data["audio_path"], Path(path).resolve().parent)),
                     text=data["text"],
                     language=data["language"],
                     prompt=data["prompt"],
@@ -1338,7 +993,7 @@ class DataProcessor:
         with open(path, "a", encoding="utf-8") as f:
             for record in records:
                 data = {
-                    "audio_path": record.audio_path,
+                    "audio_path": os.path.relpath(record.audio_path, Path(path).resolve().parent),
                     "text": record.text,
                     "language": record.language,
                     "prompt": record.prompt,
@@ -1355,5 +1010,9 @@ class DataProcessor:
             + list(silence_records)[:: self.subsampling_factor_for_silence]
         )
 
+        retained = {record.audio_path for record in filtered_records}
+        for record in records:
+            if record.audio_path not in retained:
+                Path(record.audio_path).unlink(missing_ok=True)
         Path(self.output).unlink()
         self.write_records(filtered_records, self.output)

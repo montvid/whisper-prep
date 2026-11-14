@@ -9,14 +9,15 @@ from pathlib import Path
 from whisper_prep.generation.data_processor import DataProcessor
 from whisper_prep.generation.text_normalizer import normalize_text
 
+
 class TestDataProcessorVTT(unittest.TestCase):
     def test_read_utterances_from_vtt_strips_multiline_font_tags(self):
         vtt_content = (
             "WEBVTT\n\n"
             "406\n"
             "00:25:07.640 --> 00:25:10.240\n"
-            "<font color=\"#008000\">Mir tat nur beim Gedanken daran</font>\n"
-            "<font color=\"#008000\">wieder alles weh.</font>\n\n"
+            '<font color="#008000">Mir tat nur beim Gedanken daran</font>\n'
+            '<font color="#008000">wieder alles weh.</font>\n\n'
             "407\n"
             "00:25:10.320 --> 00:25:13.000 align:start position:10%\n"
             "<i>Dann ging es weiter.</i>\n"
@@ -44,7 +45,7 @@ class TestDataProcessorVTT(unittest.TestCase):
         vtt_content = (
             "WEBVTT\n\n"
             "00:29:05.400 --> 00:29:07.560\n"
-            "<font color=\"#00ffff\">weil das wach hält.</font> <font\n"
+            '<font color="#00ffff">weil das wach hält.</font> <font\n'
         )
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".vtt", delete=False, encoding="utf-8")
         tmp.write(vtt_content)
@@ -64,7 +65,7 @@ class TestDataProcessorVTT(unittest.TestCase):
         vtt_content = (
             "WEBVTT\n\n"
             "00:00:26.710 --> 00:00:27.730\n"
-            "<font color=\"#ffffff\">* Jauchzer *</font>\n\n"
+            '<font color="#ffffff">* Jauchzer *</font>\n\n'
             "00:00:27.730 --> 00:00:29.000\n"
             "Hello (World)\n"
         )
@@ -78,12 +79,12 @@ class TestDataProcessorVTT(unittest.TestCase):
         # Expect two utterances parsed
         self.assertEqual(len(utterances), 2)
 
-        # Normalize their texts: first should drop <font> content, second should drop parentheses content
+        # Conservative normalization preserves potentially spoken text.
         normalized_texts = [normalize_text(u.text) for u in utterances]
-        # First cue becomes empty (filtered out later if desired)
-        self.assertEqual(normalized_texts[0], "")
-        # Second cue drops '(World)' leaving only 'Hello'
-        self.assertEqual(normalized_texts[1], "Hello")
+        # Event markers can be removed explicitly with drop_text.
+        self.assertEqual(normalized_texts[0], "* Jauchzer *")
+        # Bracketed speech is retained.
+        self.assertEqual(normalized_texts[1], "Hello (World)")
 
         # Clean up temporary file
         Path(tmp.name).unlink()
