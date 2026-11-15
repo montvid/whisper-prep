@@ -134,6 +134,11 @@ def main(config=None):
     source_audio, source_transcript, mapping, sentence_route = _resolve_input_sources(
         config.to_dict(), audio_dir, transcript_dir
     )
+    if (sentence_route and config.vad_chance > 0) or config.validate_empty_with_vad:
+        from whisper_prep.audio.vad import get_vad_model
+
+        # Fail before replacing output if the selected runtime/model is unavailable.
+        get_vad_model(config.vad_backend)
     generated = [output_dir, hf_folder, out_folder / "normalized_transcripts"]
     if sentence_route:
         generated += [audio_dir, transcript_dir]
@@ -218,6 +223,8 @@ def main(config=None):
         normalize_unicode=config.normalize_unicode,
         tokenizer_type=config.tokenizer_type,
         max_error_rate=config.max_error_rate,
+        audio_format=config.audio_format,
+        vad_backend=config.vad_backend,
     )
     input_rows = (
         _normalize_inputs(processor, out_folder, config, skip, config.drop_text)

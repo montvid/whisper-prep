@@ -27,6 +27,15 @@ The lock's default Linux PyTorch distribution includes CUDA dependencies.
 Importing `whisper_prep` does not initialize models or download data. Language
 filtering loads fastText on first use and may download its language model.
 
+For faster CPU VAD, install `pip install -e '.[onnx]'` and set
+`vad_backend: onnx-sequence`. Silero 6.2.3 processes frames in blocks with ONNX
+Runtime; `torch` remains the default backend. Set `audio_format: flac` for
+lossless 16-bit fused recordings and final segments, including the embedded
+audio in the exported Hugging Face dataset.
+
+For a bounded, resumable rebuild of local LIEPA-3 Parquet files, see
+[the LIEPA-3 runbook](docs/liepa3.md).
+
 The language model is [fastText lid.176.ftz](https://fasttext.cc/docs/en/language-identification.html),
 licensed under CC BY-SA 3.0. Its checksum is verified before loading. Offline
 runs can set `WHISPER_PREP_LANGUAGE_MODEL` to a previously downloaded copy.
@@ -140,7 +149,7 @@ out_folder_base/dataset_name/split_name/
 │   ├── data.ljson                  # audio_path, text, language, prompt
 │   ├── data.summary.json           # File, cue and output counts
 │   ├── data.errors.json            # Present when files fail
-│   └── dump/<id>/<start_ms>.mp3
+│   └── dump/<id>/<start_ms>.<audio_format>
 ├── hf/                             # Saved Hugging Face DatasetDict
 ├── bad_examples.tsv                # Quality-filtered records, when present
 ├── french_examples.tsv             # Likewise english_examples.tsv

@@ -81,6 +81,8 @@ class DataProcessor:
         n_jobs: int = 1,
         seed: int = 42,
         max_error_rate: float = 0.0,
+        audio_format: str = "mp3",
+        vad_backend: str = "torch",
     ) -> None:
         self.with_timestamps = with_timestamps
         self.audio_dir = audio_dir
@@ -107,6 +109,8 @@ class DataProcessor:
         self.n_jobs = n_jobs
         self.seed = seed
         self.max_error_rate = max_error_rate
+        self.audio_format = audio_format
+        self.vad_backend = vad_backend
         self.rng = random.Random(seed)
         self.stats = Counter()
         self.filtered_segment_records: List[dict] = []
@@ -117,6 +121,12 @@ class DataProcessor:
         Path(self.dump_dir).mkdir(parents=True, exist_ok=True)
 
     def _verify_args(self) -> None:
+        from whisper_prep.audio.vad import VAD_BACKENDS
+
+        if self.audio_format not in {"mp3", "wav", "flac"}:
+            raise ValueError("audio_format must be mp3, wav or flac")
+        if self.vad_backend not in VAD_BACKENDS:
+            raise ValueError("vad_backend must be torch, onnx or onnx-sequence")
         if self.with_timestamps:
             if not self.transcripts_tsv:
                 if not self.audio_dir or not self.transcript_dir:
@@ -472,7 +482,7 @@ class DataProcessor:
                 "message": str(exc),
             }
             # A failed file must not leave segments that look like accepted data.
-            for path in (Path(self.dump_dir) / row["id"]).glob("*.mp3"):
+            for path in (Path(self.dump_dir) / row["id"]).glob(f"*.{self.audio_format}"):
                 path.unlink()
         finally:
             self.language = original_language
@@ -833,7 +843,7 @@ class DataProcessor:
 
         # Validate the actual encoded training audio. MP3 encoding can alter
         # VAD decisions; checking only the pre-encoding PCM is insufficient.
-        speech_ratio = silero_speech_ratio(segment_audio_path)
+        speech_ratio = silero_speech_ratio(segment_audio_path, backend=self.vad_backend)
         if speech_ratio <= self.empty_vad_max_speech_ratio:
             return True
 
@@ -850,12 +860,23 @@ class DataProcessor:
     ) -> str:
         audio_start_idx = int(segment_start * SAMPLE_RATE / 1000)
         audio_end_idx = int(segment_end * SAMPLE_RATE / 1000)
-        segment_audio_path = str((dump_dir / f"{segment_start}.mp3").absolute())
+        segment_audio_path = str((dump_dir / f"{segment_start}.{self.audio_format}").absolute())
         segment_audio = audio[
             audio_start_idx : min(
                 audio_end_idx, audio_start_idx + DURATION_IN_SAMPLES, audio.size(0)
             )
         ]
+        if self.audio_format in {"flac", "wav"}:
+            import soundfile as sf
+
+            sf.write(
+                segment_audio_path,
+                segment_audio.detach().cpu().numpy(),
+                SAMPLE_RATE,
+                format=self.audio_format.upper(),
+                subtype="PCM_16",
+            )
+            return segment_audio_path
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",

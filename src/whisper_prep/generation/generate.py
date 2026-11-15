@@ -80,6 +80,7 @@ def _generate(
     audio_format="mp3",
     seed=42,
     file_name="00000000",
+    vad_backend="torch",
 ):
     rng = random.Random(seed)
     offset = 0.0
@@ -95,7 +96,7 @@ def _generate(
         if rng.random() < vad_chance:
             # Use the decoded PCM already in memory, rather than decoding twice.
             waveform = np.asarray(audio_segment.get_array_of_samples(), dtype=np.float32) / 32768
-            start, end = silero_vad_collector(waveform)
+            start, end = silero_vad_collector(waveform, backend=vad_backend)
             found_speech = end is not None and end > start
         else:
             start, end, found_speech = 0.0, duration, True
@@ -166,6 +167,7 @@ def generate_fold(
     seed=42,
     tsv_quoting="csv",
     normalizer_language=None,
+    vad_backend="torch",
 ):
     for name, value in {
         "maintain_speaker_chance": maintain_speaker_chance,
@@ -182,6 +184,10 @@ def generate_fold(
         )
     if audio_format not in {"mp3", "wav", "flac"}:
         raise ValueError("audio_format must be mp3, wav or flac")
+    from whisper_prep.audio.vad import VAD_BACKENDS
+
+    if vad_backend not in VAD_BACKENDS:
+        raise ValueError("vad_backend must be torch, onnx or onnx-sequence")
     audios_folder, transcripts_folder = Path(out_folder, "audios"), Path(out_folder, "transcripts")
     for folder in (audios_folder, transcripts_folder):
         if folder.exists() and any(folder.iterdir()):
@@ -221,6 +227,7 @@ def generate_fold(
         vad_chance=vad_chance,
         keep_empty_chance=keep_empty_chance,
         audio_format=audio_format,
+        vad_backend=vad_backend,
     )
     results = _execute_parallel_process(worker, batches(), n_jobs)
     LOGGER.info(

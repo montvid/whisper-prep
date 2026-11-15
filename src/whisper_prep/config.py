@@ -25,6 +25,7 @@ class PipelineConfig:
     max_overlap_chance: float = 0.2
     max_overlap_duration: float = 0.2
     vad_chance: float = 1.0
+    vad_backend: str = "torch"
     keep_empty_chance: float = 0.0
     audio_format: str = "mp3"
     seed: int = 42
@@ -168,6 +169,10 @@ class PipelineConfig:
             raise ValueError("Unsupported audio_format or tsv_quoting")
         if self.normalizer_language not in {None, "basic", "de-CH"}:
             raise ValueError("normalizer_language must be basic or de-CH")
+        from whisper_prep.audio.vad import VAD_BACKENDS
+
+        if self.vad_backend not in VAD_BACKENDS:
+            raise ValueError("vad_backend must be torch, onnx or onnx-sequence")
         if self.tokenizer_type not in {"multilingual", "english"}:
             raise ValueError("tokenizer_type must be multilingual or english")
         sentence = bool(self.tsv_paths or self.clips_folders)

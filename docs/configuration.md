@@ -39,7 +39,7 @@ These options affect the sentence route only. Probabilities must be in [0, 1].
 | `overlap_chance` | `0.5` | Probability of overlapping clips. |
 | `max_overlap_chance` | `0.2` | Probability of choosing the maximum allowed overlap. |
 | `max_overlap_duration` | `0.2` | Nonnegative seconds of speech overlap beyond detected silence. |
-| `audio_format` | `mp3` | Fused audio format: `mp3`, `wav`, or `flac`. Final segments remain MP3. |
+| `audio_format` | `mp3` | Format of both fused recordings and final training segments: `mp3`, `wav`, or `flac`. FLAC/WAV segments use 16-bit PCM. Applies to subtitle inputs too. |
 
 ## Segmentation, normalization and filtering
 
@@ -50,6 +50,7 @@ These options affect the sentence route only. Probabilities must be in [0, 1].
 | `keep_empty_chance` | `0.0` | Probability of retaining empty/no-speech clips and untranscribed spans. |
 | `drop_empty_text` | null | Drop final empty records; null follows whether `keep_empty_chance` is zero. |
 | `validate_empty_with_vad` | `false` | Check retained empty segments for speech using their encoded audio. |
+| `vad_backend` | `torch` | Silero inference: `torch`, `onnx`, or `onnx-sequence`. Applies to fusion and empty-segment validation. ONNX backends require the `onnx` extra and run on CPU with one thread per worker. The sequence backend processes blocks of frames to reduce Python overhead. |
 | `empty_vad_max_speech_ratio` | `0.06` | Maximum accepted speech ratio (0–1) for empty records. |
 | `subsampling_factor_for_silence` | `1` | Keep every Nth empty record; delete unused generated segment audio. Original audio in the legacy timestamp-free API is preserved. Positive integer. |
 | `max_tokens_length` | `219` | Packed transcription budget including timestamps; minimum 3. |

@@ -11,10 +11,23 @@ except ImportError:  # optional dependency; only needed for VoiceActivityDetecto
     Vad = None
 
 
-@lru_cache(maxsize=1)
-def get_vad_model():
+VAD_BACKENDS = {"torch", "onnx", "onnx-sequence"}
+
+
+@lru_cache(maxsize=3)
+def get_vad_model(backend="torch"):
+    if backend not in VAD_BACKENDS:
+        raise ValueError(f"Unsupported VAD backend: {backend}")
     from silero_vad import load_silero_vad
 
+    if backend != "torch":
+        try:
+            import onnxruntime  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "ONNX VAD requires the optional extra: pip install 'whisper-prep[onnx]'"
+            ) from exc
+        return load_silero_vad(onnx=True, sequence=backend == "onnx-sequence")
     return load_silero_vad()
 
 
@@ -28,6 +41,17 @@ def get_speech_timestamps(*args, **kwargs):
     from silero_vad import get_speech_timestamps as detect
 
     return detect(*args, **kwargs)
+
+
+def _detect(audio, backend, **kwargs):
+    # Both ONNX implementations explicitly use Silero's single-threaded CPU
+    # provider. Cache one model per backend in each spawned worker.
+    if backend == "onnx-sequence":
+        from silero_vad import get_speech_timestamps_sequence
+
+        return get_speech_timestamps_sequence(audio, get_vad_model(backend), **kwargs)
+    model = get_vad_model() if backend == "torch" else get_vad_model(backend)
+    return get_speech_timestamps(audio, model, **kwargs)
 
 
 def _waveform(audio):
@@ -139,14 +163,15 @@ def silero_vad_collector(
     min_silence_duration_ms: int = 100,
     window_size_samples: int = 1024,
     speech_pad_ms: int = 30,
+    backend: str = "torch",
 ) -> tuple[float, float]:
 
     audio = _waveform(path)
 
     # Get speech timestamps
-    speech_timestamps = get_speech_timestamps(
+    speech_timestamps = _detect(
         audio,
-        get_vad_model(),
+        backend,
         threshold=threshold,
         min_speech_duration_ms=min_speech_duration_ms,
         min_silence_duration_ms=min_silence_duration_ms,
@@ -170,14 +195,15 @@ def silero_speech_ratio(
     min_silence_duration_ms: int = 100,
     window_size_samples: int = 1024,
     speech_pad_ms: int = 30,
+    backend: str = "torch",
 ) -> float:
     audio = _waveform(path)
     if len(audio) == 0:
         return 0.0
 
-    speech_timestamps = get_speech_timestamps(
+    speech_timestamps = _detect(
         audio,
-        get_vad_model(),
+        backend,
         threshold=threshold,
         min_speech_duration_ms=min_speech_duration_ms,
         min_silence_duration_ms=min_silence_duration_ms,
