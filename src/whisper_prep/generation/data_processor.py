@@ -164,10 +164,10 @@ class DataProcessor:
         if self.n_jobs < 1:
             raise ValueError(f"n_jobs must be at least 1, got {self.n_jobs}")
 
-    def run(self) -> None:
+    def run(self, *, input_rows=None) -> None:
         try:
             if self.with_timestamps:
-                self._process_with_timestamps()
+                self._process_with_timestamps(input_rows)
             else:
                 self._process_without_timestamps()
             if self.subsampling_factor_for_silence > 1:
@@ -388,8 +388,10 @@ class DataProcessor:
         kwargs.update(n_jobs=1, subsampling_factor_for_silence=1)
         return kwargs
 
-    def _process_with_timestamps(self) -> None:
-        rows = self._input_rows()  # Validate IDs/languages before writing any audio.
+    def _process_with_timestamps(self, rows=None) -> None:
+        # Supplied rows were validated before optional subtitle normalization.
+        if rows is None:
+            rows = self._input_rows()
         Path(self.output).parent.mkdir(parents=True, exist_ok=True)
         Path(self.output).touch()
         if self.n_jobs > 1 and rows:
@@ -423,6 +425,13 @@ class DataProcessor:
             )
 
     def _process_row(self, row):
+        if row.get("_normalization_error"):
+            return {
+                "records": [],
+                "filtered_records": [],
+                "error": row["_normalization_error"],
+                "stats": {},
+            }
         original_language = self.language
         self.language = row["language"]
         self.rng = random.Random(f"{self.seed}:{row['id']}")
@@ -1010,9 +1019,12 @@ class DataProcessor:
             + list(silence_records)[:: self.subsampling_factor_for_silence]
         )
 
-        retained = {record.audio_path for record in filtered_records}
-        for record in records:
-            if record.audio_path not in retained:
-                Path(record.audio_path).unlink(missing_ok=True)
+        # The timestamp-free route references original recordings; only the
+        # timestamped route creates disposable segment audio for these records.
+        if self.with_timestamps:
+            retained = {record.audio_path for record in filtered_records}
+            for record in records:
+                if record.audio_path not in retained:
+                    Path(record.audio_path).unlink(missing_ok=True)
         Path(self.output).unlink()
         self.write_records(filtered_records, self.output)

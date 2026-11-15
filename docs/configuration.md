@@ -51,7 +51,7 @@ These options affect the sentence route only. Probabilities must be in [0, 1].
 | `drop_empty_text` | null | Drop final empty records; null follows whether `keep_empty_chance` is zero. |
 | `validate_empty_with_vad` | `false` | Check retained empty segments for speech using their encoded audio. |
 | `empty_vad_max_speech_ratio` | `0.06` | Maximum accepted speech ratio (0–1) for empty records. |
-| `subsampling_factor_for_silence` | `1` | Keep every Nth empty record; delete unused segment audio. Positive integer. |
+| `subsampling_factor_for_silence` | `1` | Keep every Nth empty record; delete unused generated segment audio. Original audio in the legacy timestamp-free API is preserved. Positive integer. |
 | `max_tokens_length` | `219` | Packed transcription budget including timestamps; minimum 3. |
 | `max_prompt_length` | `223` | Maximum previous-context tokens; zero disables prompts. |
 | `rep_threshold` | `3` | Minimum repeated identical consecutive cues to reject; minimum 2. |
@@ -77,7 +77,7 @@ training audio. Unusable cues and VAD rejections are counted separately.
 | `n_jobs` | `1` | Positive worker count. |
 | `transcripts_tsv_n_jobs` | null | Override segmentation workers for both mapping and folder input. |
 | `netflix_normalize_n_jobs` | null | Override normalization workers; otherwise uses segmentation worker setting. |
-| `max_error_rate` | `0.0` | Allowed fraction of failed input files (0–1); default fails on any error. Does not suppress schema/preflight or fusion errors. |
+| `max_error_rate` | `0.0` | Allowed fraction of failed input files (0–1), including subtitle normalization failures; default fails on any error. Does not suppress schema/preflight or fusion errors. |
 | `overwrite_output` | `false` | Replace generated artifacts on a rerun. Existing output otherwise fails before fusion. |
 | `upload_to_hu` | `false` | Publish the resulting dataset to the Hub. |
 | `hu_repo` | null | Required `owner/dataset` when uploading. |
@@ -87,3 +87,8 @@ Changing worker counts preserves ordering and seeded choices for the same input
 and library versions. MP3 bitstreams need not be identical across FFmpeg or
 TorchCodec versions. Worker failures include traceback logs, source paths,
 exception type, `data.errors.json` and `data.summary.json` totals.
+
+Malformed subtitle timing lines and untimed cue blocks are file errors, not
+empty transcripts. Valid empty SRTs and VTT headers/metadata remain supported.
+Language-model initialization, checksum and prediction errors stop filtering
+instead of silently accepting the affected records.

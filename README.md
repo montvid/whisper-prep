@@ -96,6 +96,8 @@ Configuration paths resolve against the current working directory. Unknown
 options and invalid values fail before processing. Existing generated output
 fails before sentence fusion; `overwrite_output: true` replaces generated
 artifacts. Keep source files separate from the output directory.
+Overwrite preflight checks sentence TSV audio references as well as transcript
+mappings before removing generated files.
 
 ## Processing behavior
 
@@ -105,6 +107,8 @@ artifacts. Keep source files separate from the output directory.
   overlaps retain both texts in one interval.
 - Final cues up to one second beyond the audio are clamped. Larger overruns,
   reversed timestamps and repeated hallucinations are reported and excluded.
+  Malformed timing lines or untimed cue blocks are reported as file errors;
+  they cannot silently turn a recording into an empty transcript.
 - `normalize_text: true` performs conservative Unicode/whitespace cleanup.
   Language-specific expansion requires `normalizer_language: de-CH`; it is
   intended only for Swiss German transcripts.
@@ -122,7 +126,8 @@ artifacts. Keep source files separate from the output directory.
 - Given the same input and software versions, fixed seeds produce the same
   ordering, sampling, fusion names and metadata across worker counts.
 - File failures log tracebacks and write error/summary JSON. By default any
-  file failure makes the run fail; `max_error_rate` permits an explicit fraction.
+  file failure makes the run fail; `max_error_rate` permits an explicit fraction,
+  including failures during subtitle normalization.
 
 ## Output
 

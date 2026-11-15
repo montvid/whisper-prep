@@ -35,16 +35,36 @@ def read_subtitle_text(path: str | Path) -> str:
 
 def read_cues(path: str | Path) -> list[Utterance]:
     text = read_subtitle_text(path).replace("\r\n", "\n").replace("\r", "\n")
-    if Path(path).suffix.lower() == ".vtt":
+    is_vtt = Path(path).suffix.lower() == ".vtt"
+    if is_vtt:
         # Metadata blocks are separated by blank lines in WebVTT.
         text = "\n\n".join(
             block
             for block in re.split(r"\n[ \t]*\n", text)
             if not re.match(r"^(?:NOTE(?:\s|$)|STYLE(?:\s|$)|REGION(?:\s|$))", block.lstrip())
         )
+    for block in re.split(r"\n[ \t]*\n", text):
+        if not block.strip() or any(TIMING_LINE.fullmatch(line) for line in block.splitlines()):
+            continue
+        if is_vtt and re.fullmatch(
+            r"WEBVTT(?:[ \t][^\n]*)?(?:\n[ \t]*[A-Za-z][\w-]*[=:][^\n]*)*", block.strip()
+        ):
+            continue  # Empty VTTs may still contain a signature and header metadata.
+        raise ValueError(f"No valid subtitle timing lines in {path}: {block.strip()!r}")
     lines = text.splitlines()
-    indices = [(i, TIMING_LINE.fullmatch(line)) for i, line in enumerate(lines)]
-    indices = [(i, match) for i, match in indices if match is not None]
+    indices = []
+    in_cue = False
+    for index, line in enumerate(lines):
+        match = TIMING_LINE.fullmatch(line)
+        if match:
+            indices.append((index, match))
+            in_cue = True
+        elif not line.strip():
+            in_cue = False
+        elif "-->" in line and (not in_cue or re.match(r"\s*-?(?:\d+:)?\d{2}:\d{2}[.,]", line)):
+            # Preserve ordinary arrows in cue text; reject broken timing lines,
+            # including cues whose blank separator is missing.
+            raise ValueError(f"Invalid subtitle timing line in {path}:{index + 1}: {line!r}")
     cues = []
     for position, (index, match) in enumerate(indices):
         stop = indices[position + 1][0] if position + 1 < len(indices) else len(lines)
@@ -67,6 +87,4 @@ def read_cues(path: str | Path) -> list[Utterance]:
         cue_text = clean_subtitle_markup(" ".join(body))
         if cue_text and cue_text != ".":
             cues.append(Utterance(cue_text, milliseconds(match[1]), milliseconds(match[2])))
-    if not indices and text.strip() and not text.strip().startswith("WEBVTT"):
-        raise ValueError(f"No valid subtitle timing lines in {path}")
     return cues

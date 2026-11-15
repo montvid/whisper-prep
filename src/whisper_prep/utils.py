@@ -77,10 +77,7 @@ def is_french(line: str, prob_th: float = 0.85) -> bool:
 
     # 1️⃣ ultra-cheap lexical heuristic
     if HEURISTIC_RE.search(txt):
-        try:
-            lang, prob = fastlid(txt)
-        except (IndexError, ValueError):  # no label came back
-            return False
+        lang, prob = fastlid(txt)
         return lang == "fr" and prob >= prob_th
 
     return False
@@ -93,10 +90,7 @@ def is_english(line: str, prob_th: float = 0.85) -> bool:
     txt = TAG_RE.sub("", line).replace("’", "'").strip()
 
     if EN_HEURISTIC_RE.search(txt):
-        try:
-            lang, prob = fastlid(txt)
-        except (IndexError, ValueError):
-            return False
+        lang, prob = fastlid(txt)
         return lang == "en" and prob >= prob_th
 
     return False

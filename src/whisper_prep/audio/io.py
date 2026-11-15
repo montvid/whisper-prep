@@ -7,8 +7,8 @@ from pydub import AudioSegment, effects
 def read_audio(
     path: Union[str, Path], resample_rate: Optional[int] = None, normalize: bool = True
 ) -> AudioSegment:
-    format = Path(path).suffix[1:]
-    audio_segment = AudioSegment.from_file(path, format=format)
+    # Extensions such as .opus name a codec, not an FFmpeg input container.
+    audio_segment = AudioSegment.from_file(path)
 
     if resample_rate is not None:
         audio_segment = audio_segment.set_frame_rate(resample_rate)

@@ -34,6 +34,7 @@ def generate_srt(captions: list[Caption], save_path: str | Path) -> None:
             original,
             start_second=original.start_second + original.offset,
             end_second=original.end_second + original.offset,
+            text=" ".join(original.text.split()),
             offset=0,
         )
         if cue.start_second < 0 or cue.end_second <= cue.start_second:

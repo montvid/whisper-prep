@@ -65,6 +65,39 @@ def save_hf_dataset(dataset, path):
     )
 
 
+def iter_sentence_rows(dataset_tsv_path, tsv_quoting="csv"):
+    """Share TSV validation without buffering the whole corpus during preflight."""
+    if tsv_quoting not in {"csv", "none"}:
+        raise ValueError("tsv_quoting must be 'csv' or 'none'")
+    with open(dataset_tsv_path, newline="", encoding="utf-8-sig") as stream:
+        reader = csv.DictReader(
+            stream,
+            delimiter="\t",
+            strict=True,
+            quoting=csv.QUOTE_MINIMAL if tsv_quoting == "csv" else csv.QUOTE_NONE,
+        )
+        try:
+            columns = reader.fieldnames or []
+            if not {"path", "clip_path"}.intersection(columns) or "sentence" not in columns:
+                raise ValueError(
+                    f"{dataset_tsv_path} requires path (or clip_path) and sentence columns"
+                )
+            path_column = "path" if "path" in columns else "clip_path"
+            for row in reader:
+                if None in row or row.get(path_column) is None or row.get("sentence") is None:
+                    raise ValueError(f"Inconsistent TSV column count in {dataset_tsv_path}")
+                yield {
+                    "path": row[path_column],
+                    "sentence": row["sentence"],
+                    "client_id": (row.get("client_id") or "").strip() or "0",
+                }
+        except csv.Error as exc:
+            raise ValueError(
+                f"Invalid quoted TSV {dataset_tsv_path}: {exc}. "
+                "For raw unquoted TSV, set tsv_quoting='none'."
+            ) from exc
+
+
 def combine_tsvs_to_dataframe(
     tsv_paths: list[Union[str, Path]],
     clips_folders: list[Union[str, Path]],
@@ -83,50 +116,17 @@ def combine_tsvs_to_dataframe(
     ):
         if not 0 <= partial <= 1:
             raise ValueError(f"partials values must be between 0 and 1, got {partial}")
-        with open(dataset_tsv_path, newline="", encoding="utf-8-sig") as stream:
-            reader = csv.DictReader(
-                stream,
-                delimiter="\t",
-                strict=True,
-                quoting=csv.QUOTE_MINIMAL if tsv_quoting == "csv" else csv.QUOTE_NONE,
-            )
-            try:
-                rows = list(reader)
-            except csv.Error as exc:
-                raise ValueError(
-                    f"Invalid quoted TSV {dataset_tsv_path}: {exc}. "
-                    "For raw unquoted TSV, set tsv_quoting='none'."
-                ) from exc
-            path_column = "path" if "path" in (reader.fieldnames or []) else "clip_path"
-            if any(
-                None in row or row.get(path_column) is None or row.get("sentence") is None
-                for row in rows
-            ):
-                raise ValueError(f"Inconsistent TSV column count in {dataset_tsv_path}")
-            rows = [
-                {key: value if value is not None else "" for key, value in row.items()}
-                for row in rows
-            ]
-            data = pd.DataFrame(rows, columns=reader.fieldnames)
-        if not {"path", "clip_path"}.intersection(data.columns) or "sentence" not in data:
-            raise ValueError(
-                f"{dataset_tsv_path} requires path (or clip_path) and sentence columns"
-            )
+        data = pd.DataFrame(
+            iter_sentence_rows(dataset_tsv_path, tsv_quoting),
+            columns=["path", "sentence", "client_id"],
+        )
 
         if partial < 1.0:
             data = data.sample(frac=partial, random_state=seed)
 
-        data["sentence"] = data["sentence"].fillna("") if "sentence" in data.columns else ""
         for row in tqdm(pd.DataFrame.itertuples(data), total=len(data)):
-            sentence = row.sentence if pd.notna(row.sentence) else ""
-            sample_path = row.path if hasattr(row, "path") else row.clip_path
-            audio_file_path = Path(clips_folder, sample_path).resolve()
-
-            client_id = "0"
-            if hasattr(row, "client_id"):
-                client_id = row.client_id.strip() or "0"
-
-            combined_dataset.append((sentence, audio_file_path, client_id))
+            audio_file_path = Path(clips_folder, row.path).resolve()
+            combined_dataset.append((row.sentence, audio_file_path, row.client_id))
 
     return pd.DataFrame(data=combined_dataset, columns=["sentence", "audio_file_path", "client_id"])
 

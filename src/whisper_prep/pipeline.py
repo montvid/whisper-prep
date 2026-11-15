@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import shutil
+from itertools import chain
 from multiprocessing import get_context
 from pathlib import Path
 
@@ -18,6 +19,14 @@ from whisper_prep.utils import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _sentence_audio_paths(config):
+    from whisper_prep.dataset.convert import iter_sentence_rows
+
+    for tsv, clips in zip(config.tsv_paths, config.clips_folders, strict=True):
+        for row in iter_sentence_rows(tsv, config.tsv_quoting):
+            yield Path(clips, row["path"])
 
 
 def _resolve_input_sources(config, audio_dir, transcript_dir):
@@ -61,7 +70,22 @@ def _apply_basic_text_filters(
 
 def _normalize_row(task):
     row, destination, skip, drop = task
-    normalized = netflix_normalize_file(row["srt_path"], skip, drop, destination)
+    try:
+        normalized = netflix_normalize_file(row["srt_path"], skip, drop, destination)
+    except Exception as exc:
+        LOGGER.exception(
+            "Failed normalizing subtitles %s for audio %s", row["srt_path"], row["audio_path"]
+        )
+        return {
+            **row,
+            "_normalization_error": {
+                "audio_path": row["audio_path"],
+                "transcript_path": row["srt_path"],
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "stage": "normalization",
+            },
+        }
     return {**row, "srt_path": str(normalized.resolve())}
 
 
@@ -90,6 +114,7 @@ def _normalize_inputs(processor, out_folder, config, skip, drop):
         writer.writeheader()
         writer.writerows(normalized)
     processor.transcripts_tsv = str(mapping)
+    return normalized
 
 
 def main(config=None):
@@ -112,6 +137,17 @@ def main(config=None):
     generated = [output_dir, hf_folder, out_folder / "normalized_transcripts"]
     if sentence_route:
         generated += [audio_dir, transcript_dir]
+    reports = [
+        path
+        for pattern in (
+            "bad_examples.tsv",
+            "french_examples.tsv",
+            "english_examples.tsv",
+            "filtered_*_segments.tsv",
+            "filtered_*_records.tsv",
+        )
+        for path in out_folder.glob(pattern)
+    ]
     # Never allow overwrite cleanup to remove a configured source location.
     inputs = [config.transcripts_tsv, config.source_audio_dir, config.source_transcript_dir]
     inputs += (config.tsv_paths or []) + (config.clips_folders or [])
@@ -124,9 +160,12 @@ def main(config=None):
                     for key in ("audio_path", "srt_path")
                     if row.get(key)
                 )
+    if sentence_route:
+        inputs = chain(inputs, _sentence_audio_paths(config))
+    artifacts = generated + reports
     for value in filter(None, inputs):
         source = Path(value).resolve()
-        if any(source == artifact or artifact in source.parents for artifact in generated):
+        if any(source == artifact or artifact in source.parents for artifact in artifacts):
             raise ValueError(
                 f"Input {source} is inside generated output; choose a separate output directory"
             )
@@ -141,15 +180,8 @@ def main(config=None):
     if config.overwrite_output:
         for path in existing:
             shutil.rmtree(path) if path.is_dir() else path.unlink()
-        for pattern in (
-            "bad_examples.tsv",
-            "french_examples.tsv",
-            "english_examples.tsv",
-            "filtered_*_segments.tsv",
-            "filtered_*_records.tsv",
-        ):
-            for path in out_folder.glob(pattern):
-                path.unlink()
+        for path in reports:
+            path.unlink()
     output_dir.mkdir(parents=True, exist_ok=True)
     from whisper_prep.dataset.convert import ljson_to_pandas, pandas_to_hf_dataset, save_hf_dataset
     from whisper_prep.generation.data_processor import DataProcessor
@@ -187,9 +219,12 @@ def main(config=None):
         tokenizer_type=config.tokenizer_type,
         max_error_rate=config.max_error_rate,
     )
-    if config.netflix_normalize:
+    input_rows = (
         _normalize_inputs(processor, out_folder, config, skip, config.drop_text)
-    processor.run()
+        if config.netflix_normalize
+        else None
+    )
+    processor.run(input_rows=input_rows)
     df = ljson_to_pandas(output_file)
     original_paths = set(df["audio"])
     df = _apply_basic_text_filters(
