@@ -22,6 +22,7 @@ from whisper.utils import format_timestamp
 from whisper_prep.audio.vad import silero_speech_ratio
 from whisper_prep.generation.typing import PromptNode, Record, Utterance
 from whisper_prep.subtitling.parse import milliseconds, read_cues
+from whisper_prep.subtitling.srt import can_trim_overlap
 from whisper_prep.text import (
     clean_subtitle_markup,
     drop_text_fragments,
@@ -301,6 +302,7 @@ class DataProcessor:
         self, utterances, filtered_out=None, source_id=None, transcript_path=None
     ) -> List[Utterance]:
         filtered_out = filtered_out if filtered_out is not None else []
+        self._validate_invalid_timestamps(utterances)
         valid = []
         for cue in utterances:
             if cue.start is None or cue.end is None or cue.start < 0 or cue.start >= cue.end:
@@ -333,7 +335,9 @@ class DataProcessor:
             if repaired and repaired[-1].end > cue.start:
                 previous = repaired[-1]
                 self.stats["repaired_overlaps"] += 1
-                if previous.start < cue.start and previous.end - cue.start <= 500:
+                if previous.end - cue.start <= 500 and can_trim_overlap(
+                    previous.start / 1000, previous.end / 1000, cue.start / 1000
+                ):
                     previous.end = cue.start
                 else:
                     # Simultaneous/nested cues cannot have monotone timestamps;
@@ -343,6 +347,27 @@ class DataProcessor:
                     continue
             repaired.append(cue)
         return repaired
+
+    @staticmethod
+    def _validate_invalid_timestamps(cues):
+        valid = [
+            cue
+            for cue in cues
+            if cue.start is not None and cue.end is not None and 0 <= cue.start < cue.end
+        ]
+        for cue in cues:
+            if cue.start is None or cue.end is None or cue.start <= cue.end:
+                continue
+            start, end = max(0, cue.end), cue.start
+            if end - start > DURATION or any(
+                other.start < end and other.end > start for other in valid
+            ):
+                # Neither endpoint locates this speech reliably. Do not infer
+                # a huge exclusion interval and silently discard valid cues.
+                raise ValueError(
+                    f"Ambiguous reversed subtitle timestamps {cue.start} -> {cue.end}: "
+                    "repair the transcript before processing this file"
+                )
 
     @staticmethod
     def _language_code(value):
@@ -404,6 +429,51 @@ class DataProcessor:
             rows = self._input_rows()
         Path(self.output).parent.mkdir(parents=True, exist_ok=True)
         Path(self.output).touch()
+        checked = []
+        for row in rows:
+            row = dict(row)
+            if not row.get("_normalization_error"):
+                try:
+                    if not Path(row["audio_path"]).is_file():
+                        raise FileNotFoundError(row["audio_path"])
+                    transcript = Path(row["srt_path"])
+                    if transcript.suffix.lower() not in {".srt", ".vtt"}:
+                        raise ValueError(f"Unsupported transcript format: {transcript.suffix}")
+                    self._validate_invalid_timestamps(read_cues(transcript))
+                except Exception as exc:
+                    LOGGER.exception(
+                        "Input preflight failed for %s with subtitles %s",
+                        row["audio_path"],
+                        row["srt_path"],
+                    )
+                    row["_preflight_error"] = {
+                        "audio_path": row["audio_path"],
+                        "transcript_path": row["srt_path"],
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "stage": "preflight",
+                    }
+            checked.append(row)
+        rows = checked
+        errors = [row.get("_normalization_error") or row.get("_preflight_error") for row in rows]
+        failed = sum(bool(error) for error in errors)
+        if failed / max(1, len(rows)) > self.max_error_rate:
+            self._consume_results(
+                (
+                    {
+                        "records": [],
+                        "filtered_records": [],
+                        "error": error,
+                        "stats": {} if error else {"preflight_skipped_files": 1},
+                    }
+                    for error in errors
+                ),
+                len(rows),
+            )
+            raise RuntimeError(
+                f"Failed to process {failed}/{len(rows)} files during preflight; "
+                f"see {Path(self.output).with_suffix('.errors.json')}"
+            )
         if self.n_jobs > 1 and rows:
             with get_context("spawn").Pool(
                 min(self.n_jobs, len(rows)),
@@ -415,7 +485,7 @@ class DataProcessor:
             self._consume_results(map(self._process_row, rows), len(rows))
 
     def _consume_results(self, results, total):
-        summary = Counter(files=total)
+        summary = Counter(files=total, failed_files=0, output_records=0)
         filtered = []
         errors = []
         for result in tqdm(results, total=total, desc="Processing audio and subtitles"):
@@ -435,11 +505,12 @@ class DataProcessor:
             )
 
     def _process_row(self, row):
-        if row.get("_normalization_error"):
+        preflight_error = row.get("_normalization_error") or row.get("_preflight_error")
+        if preflight_error:
             return {
                 "records": [],
                 "filtered_records": [],
-                "error": row["_normalization_error"],
+                "error": preflight_error,
                 "stats": {},
             }
         original_language = self.language
@@ -605,6 +676,8 @@ class DataProcessor:
                     reason = "outside_audio"
             if cue.end - cue.start > DURATION:
                 reason = "cue_duration"
+            if cue.end - cue.start < 20:
+                reason = "cue_timestamp_resolution"
             if (
                 len(self.tokenizer.encode(self._add_leading_space(cue.text))) + 2
                 > self.max_tokens_length
@@ -735,11 +808,26 @@ class DataProcessor:
                     )
                     continue
 
+                resolution = self.timestamp_resolution
+                if any(
+                    self._get_time_token(cue.start, segment_start, audio_path)
+                    == self._get_time_token(cue.end, segment_start, audio_path)
+                    for cue in segment_utterances
+                ):
+                    # A coarse user grid can erase a valid short cue. Use
+                    # Whisper's native grid for this whole window so adjacent
+                    # cues remain ordered and every complete cue has duration.
+                    resolution = 20
+                    self.stats["fine_timestamp_windows"] += 1
                 tokens_length = 0
                 segment_text = []
                 for utterance in segment_utterances:
-                    start_token = self._get_time_token(utterance.start, segment_start, audio_path)
-                    end_token = self._get_time_token(utterance.end, segment_start, audio_path)
+                    start_token = self._get_time_token(
+                        utterance.start, segment_start, audio_path, resolution
+                    )
+                    end_token = self._get_time_token(
+                        utterance.end, segment_start, audio_path, resolution
+                    )
                     utterance_text = self._add_leading_space(utterance.text)
                     segment_text.extend([start_token, utterance_text, end_token])
                     new_prompt_length = len(self.tokenizer.encode(utterance_text)) + 2
@@ -759,10 +847,9 @@ class DataProcessor:
                 # performed on an audio window aligned with that time").
                 if next_segment_start is not None:
                     dangling_token = self._get_time_token(
-                        next_segment_start, segment_start, audio_path
+                        next_segment_start, segment_start, audio_path, resolution
                     )
                     segment_text.append(dangling_token)
-                    prompt_buffer.append(PromptNode(dangling_token, 1))
                     tokens_length += 1
 
                 if tokens_length > self.max_tokens_length:
@@ -971,7 +1058,9 @@ class DataProcessor:
 
     str_to_milliseconds = staticmethod(milliseconds)
 
-    def _get_time_token(self, time: int, segment_start: int, audio_path: Path) -> str:
+    def _get_time_token(
+        self, time: int, segment_start: int, audio_path: Path, resolution=None
+    ) -> str:
         """
         Get the time token for the given time.
 
@@ -990,9 +1079,10 @@ class DataProcessor:
             )
 
         time_in_segment = time - segment_start
+        resolution = self.timestamp_resolution if resolution is None else resolution
         nearest_timestamp = min(
             DURATION,
-            (round(time_in_segment / self.timestamp_resolution) * self.timestamp_resolution),
+            ((time_in_segment + resolution // 2) // resolution * resolution),
         )  # in milliseconds; coarse custom resolutions must not exceed 30 s.
         time_token = f"<|{nearest_timestamp / 1000:.2f}|>"
         return time_token

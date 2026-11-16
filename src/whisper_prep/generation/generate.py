@@ -1,8 +1,9 @@
 """Deterministic sentence fusion with bounded per-speaker queues."""
 
+import json
 import logging
 import random
-from collections import deque
+from collections import Counter, deque
 from functools import partial
 from inspect import signature
 from multiprocessing import get_context
@@ -17,6 +18,7 @@ from whisper_prep.audio.vad import silero_vad_collector
 from whisper_prep.dataset.convert import combine_tsvs_to_dataframe
 from whisper_prep.generation.text_normalizer import normalize_text as normalize_text_
 from whisper_prep.subtitling.srt import Caption, generate_srt
+from whisper_prep.text import clean_subtitle_markup
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,8 +63,12 @@ def _ordered_samples(data, maintain_speaker_chance, rng):
 
 def _generate_wrapper(sample, *, seed=42, **kwargs):
     index, clips = sample
+    stats, errors = Counter(), []
     try:
-        return _generate(clips, seed=seed + index, file_name=f"{index:08d}", **kwargs)
+        created = _generate(
+            clips, seed=seed + index, file_name=f"{index:08d}", stats=stats, errors=errors, **kwargs
+        )
+        return {"created": created, "stats": dict(stats), "errors": errors}
     except Exception:
         LOGGER.exception("Failed to fuse sample %s (%d input clips)", index, len(clips))
         raise
@@ -81,38 +87,72 @@ def _generate(
     seed=42,
     file_name="00000000",
     vad_backend="torch",
+    skip_decode_errors=False,
+    stats=None,
+    errors=None,
 ):
+    stats = stats if stats is not None else Counter()
+    errors = errors if errors is not None else []
     rng = random.Random(seed)
     offset = 0.0
     combined_audio = AudioSegment.empty()
     captions = []
     previous_space_after_speech = 0.0
+    previous_speech_duration = 0.0
     for segment in constructed_samples:
-        sentence = (segment["sentence"] or "").strip()
-        audio_segment = (
-            read_audio(segment["path"], resample_rate=16000).set_channels(1).set_sample_width(2)
-        )
+        stats["input_clips"] += 1
+        sentence = clean_subtitle_markup(segment["sentence"] or "")
+        if sentence == ".":
+            # The subtitle reader treats a bare period as an empty placeholder.
+            # Keeping its audio would otherwise leave speech without a caption.
+            stats["skipped_placeholder_text"] += 1
+            continue
+        try:
+            audio_segment = (
+                read_audio(segment["path"], resample_rate=16000).set_channels(1).set_sample_width(2)
+            )
+        except Exception as exc:
+            if not skip_decode_errors:
+                raise
+            stats["failed_clips"] += 1
+            errors.append(
+                {"path": str(segment["path"]), "type": type(exc).__name__, "message": str(exc)}
+            )
+            LOGGER.exception("Failed decoding fusion clip %s", segment["path"])
+            continue
         duration = audio_segment.duration_seconds
-        if rng.random() < vad_chance:
+        if rng.random() < vad_chance or not sentence:
             # Use the decoded PCM already in memory, rather than decoding twice.
             waveform = np.asarray(audio_segment.get_array_of_samples(), dtype=np.float32) / 32768
             start, end = silero_vad_collector(waveform, backend=vad_backend)
             found_speech = end is not None and end > start
         else:
             start, end, found_speech = 0.0, duration, True
-        if not sentence or not found_speech:
+        if not sentence and found_speech:
+            stats["skipped_unlabelled_speech"] += 1
+            continue
+        if not found_speech:
             if rng.random() >= keep_empty_chance:
+                stats["skipped_no_speech" if sentence else "skipped_empty_text"] += 1
                 continue
             sentence, start, end = "", 0.0, duration
+        stats["kept_speech_clips" if sentence else "kept_empty_clips"] += 1
         overlap = 0.0
         if len(combined_audio) and rng.random() < overlap_chance:
+            # Silence may overlap freely. Bound overlap of actual speech by
+            # both clips' speech lengths, so short phonetic clips survive.
+            speech_overlap = min(
+                max_overlap_duration,
+                0.3 * previous_speech_duration,
+                0.3 * (end - start) if sentence else 0.0,
+            )
             limit = min(
-                previous_space_after_speech + start + max_overlap_duration,
+                previous_space_after_speech + start + speech_overlap,
                 combined_audio.duration_seconds,
                 duration,
             )
             overlap = limit if rng.random() < max_overlap_chance else rng.uniform(0, limit)
-            overlap_ms = round(overlap * 1000)
+            overlap_ms = int(overlap * 1000)
             overlap = overlap_ms / 1000
             combined_audio = (
                 combined_audio.overlay(
@@ -126,6 +166,7 @@ def _generate(
             captions.append(Caption(start - overlap + offset, end - overlap + offset, sentence))
         offset += duration - overlap
         previous_space_after_speech = duration - end
+        previous_speech_duration = end - start if sentence else 0.0
     if not len(combined_audio):
         return False
     audio_path = Path(audios_folder, f"{file_name}.{audio_format}")
@@ -133,7 +174,9 @@ def _generate(
     if audio_path.exists() or transcript_path.exists():
         raise FileExistsError(f"Refusing to overwrite fused sample {file_name}")
     save_audio_segment(combined_audio, audio_path, format=audio_format)
-    generate_srt(captions, transcript_path)
+    merged = generate_srt(captions, transcript_path)
+    stats["merged_captions"] += merged
+    stats["output_cues"] += len(captions) - merged
     return True
 
 
@@ -168,6 +211,7 @@ def generate_fold(
     tsv_quoting="csv",
     normalizer_language=None,
     vad_backend="torch",
+    max_error_rate=0.0,
 ):
     for name, value in {
         "maintain_speaker_chance": maintain_speaker_chance,
@@ -175,6 +219,7 @@ def generate_fold(
         "max_overlap_chance": max_overlap_chance,
         "vad_chance": vad_chance,
         "keep_empty_chance": keep_empty_chance,
+        "max_error_rate": max_error_rate,
     }.items():
         if not 0 <= value <= 1:
             raise ValueError(f"{name} must be between 0 and 1, got {value}")
@@ -228,11 +273,39 @@ def generate_fold(
         keep_empty_chance=keep_empty_chance,
         audio_format=audio_format,
         vad_backend=vad_backend,
+        skip_decode_errors=max_error_rate > 0,
     )
     results = _execute_parallel_process(worker, batches(), n_jobs)
-    LOGGER.info(
-        "Fusion: %d inputs, %d files created, %d empty batches",
-        len(data),
-        sum(results),
-        results.count(False),
+    stats = Counter(
+        {
+            key: 0
+            for key in (
+                "input_clips",
+                "failed_clips",
+                "skipped_empty_text",
+                "skipped_placeholder_text",
+                "skipped_no_speech",
+                "skipped_unlabelled_speech",
+                "kept_speech_clips",
+                "kept_empty_clips",
+                "merged_captions",
+                "output_cues",
+                "files",
+                "empty_batches",
+            )
+        }
     )
+    errors = []
+    for result in results:
+        stats.update(result["stats"])
+        stats["files" if result["created"] else "empty_batches"] += 1
+        errors.extend(result["errors"])
+    Path(out_folder, "fusion.summary.json").write_text(json.dumps(dict(stats), indent=2) + "\n")
+    if errors:
+        Path(out_folder, "fusion.errors.json").write_text(json.dumps(errors, indent=2) + "\n")
+    LOGGER.info("Fusion totals: %s", dict(stats))
+    if stats["failed_clips"] / max(1, stats["input_clips"]) > max_error_rate:
+        raise RuntimeError(
+            f"Failed to decode {stats['failed_clips']}/{stats['input_clips']} fusion clips; see {Path(out_folder, 'fusion.errors.json')}"
+        )
+    return dict(stats)

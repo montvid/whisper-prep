@@ -134,14 +134,24 @@ def main(config=None):
     source_audio, source_transcript, mapping, sentence_route = _resolve_input_sources(
         config.to_dict(), audio_dir, transcript_dir
     )
-    if (sentence_route and config.vad_chance > 0) or config.validate_empty_with_vad:
-        from whisper_prep.audio.vad import get_vad_model
-
-        # Fail before replacing output if the selected runtime/model is unavailable.
-        get_vad_model(config.vad_backend)
     generated = [output_dir, hf_folder, out_folder / "normalized_transcripts"]
     if sentence_route:
         generated += [audio_dir, transcript_dir]
+    # A rejected rerun needs no corpus traversal or model initialization.
+    existing = [path for path in generated if path.exists()]
+    if existing and not config.overwrite_output:
+        raise FileExistsError(
+            f"Output already exists: {existing[0]}; set overwrite_output=true to replace generated artifacts"
+        )
+    if sentence_route or config.validate_empty_with_vad:
+        from whisper_prep.audio.vad import get_vad_model
+
+        # Unlabelled sentence clips always require VAD, even if vad_chance=0.
+        get_vad_model(config.vad_backend)
+    if config.filter_french or config.filter_english:
+        from whisper_prep.language import get_language_model
+
+        get_language_model()
     reports = [
         path
         for pattern in (
@@ -150,6 +160,7 @@ def main(config=None):
             "english_examples.tsv",
             "filtered_*_segments.tsv",
             "filtered_*_records.tsv",
+            "fusion.*.json",
         )
         for path in out_folder.glob(pattern)
     ]
@@ -174,11 +185,6 @@ def main(config=None):
             raise ValueError(
                 f"Input {source} is inside generated output; choose a separate output directory"
             )
-    existing = [path for path in generated if path.exists()]
-    if existing and not config.overwrite_output:
-        raise FileExistsError(
-            f"Output already exists: {existing[0]}; set overwrite_output=true to replace generated artifacts"
-        )
     for path in existing:
         if path.is_symlink():
             raise ValueError(f"Refusing to remove symlinked output: {path}")
@@ -255,7 +261,11 @@ def main(config=None):
     for word in skip or []:
         if not word:
             continue
-        rejected = df["text"].str.contains(word, case=False, regex=False, na=False)
+        rejected = (
+            df["text"]
+            .map(lambda text: TAG_RE.sub("", text))
+            .str.contains(word, case=False, regex=False, na=False)
+        )
         if rejected.any():
             df[rejected].to_csv(
                 out_folder / f"filtered_{report_name(word)}_records.tsv", sep="\t", index=False

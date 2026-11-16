@@ -56,7 +56,7 @@ These options affect the sentence route only. Probabilities must be in [0, 1].
 | `max_tokens_length` | `219` | Packed transcription budget including timestamps; minimum 3. |
 | `max_prompt_length` | `223` | Maximum previous-context tokens; zero disables prompts. |
 | `rep_threshold` | `3` | Minimum repeated identical consecutive cues to reject; minimum 2. |
-| `timestamp_resolution` | `20` | Timestamp rounding in ms, a positive multiple of 20. |
+| `timestamp_resolution` | `20` | Timestamp rounding in ms, a positive multiple of 20. A window falls back to 20 ms if its configured grid would give a cue zero duration. Cues shorter than 20 ms are reported and excluded with their audio interval. |
 | `normalize_unicode` | `false` | NFKC normalization of source subtitle text. |
 | `tokenizer_type` | `multilingual` | `multilingual` or `english` Whisper tokenizer. |
 | `min_text_words` | `8` | Minimum nonempty transcript length; null/zero disables. Timestamp tokens excluded. CJK/Thai/Lao/Burmese count alphanumeric characters. |
@@ -78,7 +78,7 @@ training audio. Unusable cues and VAD rejections are counted separately.
 | `n_jobs` | `1` | Positive worker count. |
 | `transcripts_tsv_n_jobs` | null | Override segmentation workers for both mapping and folder input. |
 | `netflix_normalize_n_jobs` | null | Override normalization workers; otherwise uses segmentation worker setting. |
-| `max_error_rate` | `0.0` | Allowed fraction of failed input files (0–1), including subtitle normalization failures; default fails on any error. Does not suppress schema/preflight or fusion errors. |
+| `max_error_rate` | `0.0` | Allowed fraction of failed input files (0–1), including subtitle normalization and file preflight failures. Also applies independently to failed sentence-clip decodes in fusion. Zero stops on the first fusion decode error; a positive value collects decode failures and enforces the budget after fusion. Schema errors and model failures remain fatal. |
 | `overwrite_output` | `false` | Replace generated artifacts on a rerun. Existing output otherwise fails before fusion. |
 | `upload_to_hu` | `false` | Publish the resulting dataset to the Hub. |
 | `hu_repo` | null | Required `owner/dataset` when uploading. |
@@ -93,3 +93,21 @@ Malformed subtitle timing lines and untimed cue blocks are file errors, not
 empty transcripts. Valid empty SRTs and VTT headers/metadata remain supported.
 Language-model initialization, checksum and prediction errors stop filtering
 instead of silently accepting the affected records.
+
+Subtitle file existence, syntax, and ambiguous reversed timestamps are checked
+before any segmentation audio is encoded. Predictable failures exceeding the
+file budget write the usual error/summary reports and stop before processing
+valid files. Enabled language filters load their model before fusion or output
+replacement. An existing output is rejected before traversing sentence paths.
+
+Fusion writes `fusion.summary.json` with mutually exclusive counts for failed
+decodes, skipped empty text, bare-period placeholders, VAD-rejected speech text,
+unlabelled speech, retained labelled clips, and retained silence. It also counts
+merged captions and written cues. Allowed decode failures are listed in
+`fusion.errors.json`. Unlabelled clips always require VAD to be retained, even
+with `vad_chance: 0`; detected speech without a transcript is always excluded.
+
+Synthetic speech overlap is limited to 30% of each neighbouring speech interval.
+Subtitle overlap repair merges captions when trimming would leave less than
+200 ms or half the earlier interval. Only completed cues enter previous-context
+prompts; a partial start timestamp remains a target-only token.

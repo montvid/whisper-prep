@@ -13,7 +13,9 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
+import struct
 import sys
 import time
 from collections import Counter
@@ -25,6 +27,7 @@ from pathlib import Path
 
 SUBSETS = ("read", "spon", "phon")
 GIB = 2**30
+TIMESTAMP_RE = re.compile(r"<\|(\d+)\.(\d{2})\|>")
 
 
 def write_json(path, value):
@@ -142,14 +145,77 @@ def export_batch(shards, work, workers, min_s, max_s):
     return result
 
 
+def validate_labels(value, *, prompt=False):
+    """Validate each complete cue, allowing a target-only partial start token."""
+    matches = list(TIMESTAMP_RE.finditer(value))
+    if not matches:
+        if value.strip() or not prompt:
+            raise ValueError("Expected timestamped transcript")
+        return Counter()
+    if value[: matches[0].start()].strip() or value[matches[-1].end() :].strip():
+        raise ValueError("Text outside timestamped cues")
+    if prompt and len(matches) % 2:
+        raise ValueError("Unpaired timestamp in prompt")
+    times = [int(match[1]) * 1000 + int(match[2]) * 10 for match in matches]
+    if any(time < 0 or time > 30000 or time % 20 for time in times):
+        raise ValueError("Timestamp outside the Whisper grid")
+    counts = Counter(cues=0, short_cues=0)
+    for i in range(0, len(matches) - 1, 2):
+        if times[i + 1] <= times[i]:
+            raise ValueError("Nonpositive cue duration")
+        if not value[matches[i].end() : matches[i + 1].start()].strip():
+            raise ValueError("Empty complete cue")
+        if i and value[matches[i - 1].end() : matches[i].start()].strip():
+            raise ValueError("Text between cues")
+        if i and not prompt and times[i] < times[i - 1]:
+            raise ValueError("Overlapping target timestamps")
+        counts["cues"] += 1
+        counts["short_cues"] += times[i + 1] - times[i] < 200
+    if len(matches) % 2:
+        if len(matches) < 3 or times[-1] < times[-2]:
+            raise ValueError("Invalid partial target timestamp")
+        if value[matches[-2].end() : matches[-1].start()].strip():
+            raise ValueError("Text before partial target timestamp")
+    return counts
+
+
+def validate_flac_headers(audio):
+    """Inspect every embedded FLAC header without copying/decoding its samples."""
+    import pyarrow as pa
+
+    blobs = audio.field("bytes")
+    if audio.null_count or blobs.null_count:
+        raise ValueError("Missing embedded FLAC audio")
+    _, offsets, payload = blobs.buffers()
+    width, fmt = (8, "<q") if pa.types.is_large_binary(blobs.type) else (4, "<i")
+    payload = memoryview(payload)
+    for index in range(len(blobs)):
+        offset_index = width * (blobs.offset + index)
+        start = struct.unpack_from(fmt, offsets, offset_index)[0]
+        end = struct.unpack_from(fmt, offsets, offset_index + width)[0]
+        header = bytes(payload[start : start + 42])
+        if (
+            end - start < 42
+            or header[:4] != b"fLaC"
+            or header[4] & 127
+            or header[5:8] != b"\x00\x00\x22"
+        ):
+            raise ValueError("Expected embedded FLAC with STREAMINFO")
+        packed = int.from_bytes(header[18:26], "big")
+        rate, channels, bits = packed >> 44, ((packed >> 41) & 7) + 1, ((packed >> 36) & 31) + 1
+        samples = packed & ((1 << 36) - 1)
+        if (rate, channels, bits) != (16000, 1, 16) or not 0 < samples <= 480000:
+            raise ValueError("Expected 0–30 second, mono 16 kHz PCM16 FLAC")
+
+
 def validate_export(hf):
     import pyarrow as pa
-    import soundfile as sf
 
     split = hf / "train"
     state = json.loads((split / "state.json").read_text())
     rows, bytes_total = 0, 0
     digest = hashlib.sha256()
+    quality = Counter()
     for entry in state["_data_files"]:
         shard = split / entry["filename"]
         with pa.memory_map(str(shard), "r") as stream:
@@ -162,18 +228,13 @@ def validate_export(hf):
                         raise RuntimeError(f"Unexpected language in {shard}")
                 for column in ("text", "prompt"):
                     for value in batch.column(column).to_pylist():
+                        counts = validate_labels(value, prompt=column == "prompt")
+                        if column == "text":
+                            quality.update(counts)
                         digest.update(value.encode("utf-8"))
                         digest.update(b"\0")
                 if batch.num_rows:
-                    audio = batch.column("audio")[0].as_py()
-                    blob = audio.get("bytes")
-                    if not blob or not blob.startswith(b"fLaC"):
-                        raise RuntimeError(f"Expected embedded FLAC in {shard}")
-                    info = sf.info(io.BytesIO(blob))
-                    if (info.samplerate, info.channels, info.subtype) != (16000, 1, "PCM_16"):
-                        raise RuntimeError(f"Unexpected audio format in {shard}")
-                    if not 0 < info.duration <= 30:
-                        raise RuntimeError(f"Unexpected audio duration in {shard}")
+                    validate_flac_headers(batch.column("audio"))
         bytes_total += shard.stat().st_size
     if not rows:
         raise RuntimeError(f"No training rows in {hf}")
@@ -182,6 +243,7 @@ def validate_export(hf):
         "arrow_files": len(state["_data_files"]),
         "bytes": bytes_total,
         "text_prompt_sha256": digest.hexdigest(),
+        "label_quality": dict(quality),
     }
 
 
@@ -209,6 +271,27 @@ def pipeline_config(work, name, workers):
         seed=42,
         max_error_rate=0.0,
     )
+
+
+def validate_counts(exported, fusion, summary):
+    if summary.get("failed_files", 0) or fusion["failed_clips"]:
+        raise RuntimeError("Batch contains file or clip errors")
+    outcomes = (
+        "failed_clips",
+        "skipped_empty_text",
+        "skipped_placeholder_text",
+        "skipped_no_speech",
+        "skipped_unlabelled_speech",
+        "kept_speech_clips",
+        "kept_empty_clips",
+    )
+    if (
+        fusion["input_clips"] != exported["exported_clips"]
+        or fusion["output_cues"] != summary["input_cues"]
+        or fusion["kept_speech_clips"] != fusion["output_cues"] + fusion["merged_captions"]
+        or fusion["input_clips"] != sum(fusion[key] for key in outcomes)
+    ):
+        raise RuntimeError("Fusion counts do not reconcile")
 
 
 def build_plan(args):
@@ -300,6 +383,7 @@ def run_locked(args, plan, splits, source, output, workspace, prepare_dataset):
             receipt = final / "complete.json"
             if receipt.exists():
                 saved = json.loads(receipt.read_text())
+                validate_counts(saved["export"], saved["fusion"], saved["prep"])
                 checked = validate_export(final / "train/hf")
                 if saved["dataset"] != checked:
                     raise RuntimeError(f"Completed batch validation changed: {name}")
@@ -341,8 +425,8 @@ def run_locked(args, plan, splits, source, output, workspace, prepare_dataset):
             dataset = work / "dataset" / name / "train"
             checked = validate_export(dataset / "hf")
             summary = json.loads((dataset / "created_dataset/data.summary.json").read_text())
-            if summary.get("failed_files", 0):
-                raise RuntimeError(f"Batch contains file errors: {name}")
+            fusion = json.loads((dataset / "fusion.summary.json").read_text())
+            validate_counts(exported, fusion, summary)
             update(stage="copy", current_dataset=checked)
             check_space(output, checked["bytes"] + 10 * GIB)
             shutil.copytree(dataset / "hf", partial / "train/hf")
@@ -361,6 +445,7 @@ def run_locked(args, plan, splits, source, output, workspace, prepare_dataset):
             shutil.copyfile(
                 dataset / "created_dataset/data.summary.json", partial / "prep_summary.json"
             )
+            shutil.copyfile(dataset / "fusion.summary.json", partial / "fusion_summary.json")
             for report in dataset.glob("*.tsv"):
                 shutil.copyfile(report, partial / report.name)
             write_json(
@@ -369,6 +454,7 @@ def run_locked(args, plan, splits, source, output, workspace, prepare_dataset):
                     "dataset": checked,
                     "export": exported,
                     "prep": summary,
+                    "fusion": fusion,
                     "seconds": round(time.time() - start),
                     "git_commit": args.git_commit,
                 },

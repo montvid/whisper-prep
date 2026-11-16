@@ -8,7 +8,7 @@ from whisper_prep.generation.typing import Utterance
 from whisper_prep.text import clean_subtitle_markup
 
 TIMESTAMP = r"(?:\d+:)?\d{2}:\d{2}[.,]\d{1,3}"
-TIMING_LINE = re.compile(rf"^\s*({TIMESTAMP})\s+-->\s+({TIMESTAMP})(?:\s+.*)?$")
+TIMING_LINE = re.compile(rf"^\s*({TIMESTAMP})\s*-->\s*({TIMESTAMP})(?:\s+.*)?$")
 
 
 def milliseconds(value: str) -> int:
@@ -36,14 +36,19 @@ def read_subtitle_text(path: str | Path) -> str:
 def read_cues(path: str | Path) -> list[Utterance]:
     text = read_subtitle_text(path).replace("\r\n", "\n").replace("\r", "\n")
     is_vtt = Path(path).suffix.lower() == ".vtt"
+    separator = r"\n\n" if is_vtt else r"\n[ \t]*\n"
+
+    def empty_line(line):
+        return line == "" if is_vtt else not line.strip()
+
     if is_vtt:
         # Metadata blocks are separated by blank lines in WebVTT.
         text = "\n\n".join(
             block
-            for block in re.split(r"\n[ \t]*\n", text)
+            for block in re.split(separator, text)
             if not re.match(r"^(?:NOTE(?:\s|$)|STYLE(?:\s|$)|REGION(?:\s|$))", block.lstrip())
         )
-    for block in re.split(r"\n[ \t]*\n", text):
+    for block in re.split(separator, text):
         if not block.strip() or any(TIMING_LINE.fullmatch(line) for line in block.splitlines()):
             continue
         if is_vtt and re.fullmatch(
@@ -59,7 +64,7 @@ def read_cues(path: str | Path) -> list[Utterance]:
         if match:
             indices.append((index, match))
             in_cue = True
-        elif not line.strip():
+        elif empty_line(line):
             in_cue = False
         elif "-->" in line and (not in_cue or re.match(r"\s*-?(?:\d+:)?\d{2}:\d{2}[.,]", line)):
             # Preserve ordinary arrows in cue text; reject broken timing lines,
@@ -73,7 +78,7 @@ def read_cues(path: str | Path) -> list[Utterance]:
         # to the next cue. Missing separators are supported for numeric SRT IDs.
         separated = False
         for blank, line in enumerate(body):
-            if not line.strip():
+            if empty_line(line):
                 body = body[:blank]
                 separated = True
                 break

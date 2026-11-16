@@ -27,8 +27,15 @@ def format_delta(delta: timedelta, pattern: str) -> str:
     return pattern.format(h=f"{hours:02d}", m=f"{minutes:02d}", s=f"{seconds:02d}", ms=f"{ms:03d}")
 
 
-def generate_srt(captions: list[Caption], save_path: str | Path) -> None:
+def can_trim_overlap(start, end, next_start):
+    """A repaired cue must keep at least 200 ms and half its speech interval."""
+    retained = next_start - start
+    return retained >= 0.2 and retained >= (end - start) / 2
+
+
+def generate_srt(captions: list[Caption], save_path: str | Path) -> int:
     repaired = []
+    merged = 0
     for original in captions:
         cue = replace(
             original,
@@ -41,11 +48,12 @@ def generate_srt(captions: list[Caption], save_path: str | Path) -> None:
             raise ValueError(f"Invalid generated caption: {original}")
         if repaired and cue.start_second < repaired[-1].end_second:
             previous = repaired[-1]
-            if cue.start_second > previous.start_second:
+            if can_trim_overlap(previous.start_second, previous.end_second, cue.start_second):
                 previous.end_second = cue.start_second
             else:
                 previous.text += " " + cue.text
                 previous.end_second = max(previous.end_second, cue.end_second)
+                merged += 1
                 continue
         repaired.append(cue)
     content = "".join(
@@ -53,3 +61,4 @@ def generate_srt(captions: list[Caption], save_path: str | Path) -> None:
         for i, cue in enumerate(repaired, 1)
     )
     Path(save_path).write_text(content, encoding="utf-8")
+    return merged

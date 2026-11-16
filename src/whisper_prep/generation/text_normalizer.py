@@ -149,21 +149,6 @@ def normalize_triple_dots(text: str) -> str:
     # Examples: "..." -> "...", "......" -> "...", "……" -> "..."
     text = re.sub(r"(?:\.{3,}|…+)", "...", text)
 
-    # ────────────────────────────────────────────────────────────────────────
-    # 2️⃣  tidy punctuation spacing (same as before, but ellipses are gone)
-    # ────────────────────────────────────────────────────────────────────────
-    text = (
-        text.replace(".,", ".")
-        .replace("  ", " ")
-        .replace(" ?", "?")
-        .replace(" !", "!")
-        .replace(" . ", ". ")
-        .replace(". <", ".<")
-        .replace("! <", "!<")
-        .replace("? <", "?<")
-        .replace(", <", ",<")
-    )
-
     return text.strip()
 
 
@@ -279,15 +264,13 @@ class SwissNumberConverter:
         }
 
     def combine_numbers(self, text):
-        # collapse ISO thin spaces, NBSP, etc. to plain space first
-        text = re.sub(r"[\u00A0\u202F]", " ", text)
-
-        # remove ONE space between digit groups of exactly three digits
-        text = re.sub(r"(?<=\d)\s(?=\d{3}\b)", "", text)
-
-        # remove apostrophes used the same way (Switzerland)
-        text = re.sub(r"(?<=\d)'(?=\d{3}\b)", "", text)
-        return text
+        # Match a whole grouped number, never a suffix of a year or a
+        # zero-prefixed identifier (2021 300 and 044 123 must stay separate).
+        return re.sub(
+            r"(?<![\w.,])([1-9]\d{0,2}(?:[ \u00a0\u202f']\d{3})+)(?!\d)",
+            lambda match: re.sub(r"[ \u00a0\u202f']", "", match[0]),
+            text,
+        )
 
     def replace_komma_w_dot(self, text):
         # Normalizes a comma to a dot for numbers

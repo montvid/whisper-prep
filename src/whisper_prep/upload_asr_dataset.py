@@ -1,10 +1,13 @@
 """Convert sentence/subtitle TSV metadata and optionally publish the result."""
 
 import argparse
+import csv
 from pathlib import Path
 
 
-def dataset_from_tsv(tsv, audio_column="path", split="train", sampling_rate=16000):
+def dataset_from_tsv(
+    tsv, audio_column="path", split="train", sampling_rate=16000, tsv_quoting="csv"
+):
     import pandas as pd
     import pysubs2
 
@@ -13,7 +16,25 @@ def dataset_from_tsv(tsv, audio_column="path", split="train", sampling_rate=1600
     from whisper_prep.text import resolve_path
 
     tsv = Path(tsv).resolve()
-    frame = pd.read_csv(tsv, sep="\t", keep_default_na=False, dtype=str)
+    if tsv_quoting not in {"csv", "none"}:
+        raise ValueError("tsv_quoting must be 'csv' or 'none'")
+    with tsv.open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(
+            stream,
+            delimiter="\t",
+            strict=True,
+            quoting=csv.QUOTE_MINIMAL if tsv_quoting == "csv" else csv.QUOTE_NONE,
+        )
+        try:
+            columns = reader.fieldnames or []
+            rows = list(reader)
+        except csv.Error as exc:
+            raise ValueError(
+                f"Invalid quoted TSV {tsv}: {exc}. For raw TSV use tsv_quoting='none'."
+            ) from exc
+    if any(None in row or any(value is None for value in row.values()) for row in rows):
+        raise ValueError(f"Inconsistent TSV column count in {tsv}")
+    frame = pd.DataFrame(rows, columns=columns)
     if audio_column not in frame:
         raise ValueError(f"Missing audio column {audio_column!r}")
     frame = frame.rename(columns={audio_column: "audio"})
@@ -49,13 +70,16 @@ def main():
     parser.add_argument("--split", default="train")
     parser.add_argument("--audio_column", default="path")
     parser.add_argument("--sampling_rate", default=16000, type=int)
+    parser.add_argument("--tsv-quoting", choices=["csv", "none"], default="csv")
     parser.add_argument(
         "--public", action="store_true", help="Publish publicly; default is private"
     )
     args = parser.parse_args()
     if not args.repo_id and not args.output_dir:
         parser.error("Provide --output-dir or --repo_id")
-    dataset = dataset_from_tsv(args.tsv, args.audio_column, args.split, args.sampling_rate)
+    dataset = dataset_from_tsv(
+        args.tsv, args.audio_column, args.split, args.sampling_rate, args.tsv_quoting
+    )
     if args.output_dir:
         from whisper_prep.dataset.convert import save_hf_dataset
 

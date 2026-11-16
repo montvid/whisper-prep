@@ -103,3 +103,63 @@ def test_corrupt_source_audio_stops_export(tmp_path):
     with pytest.raises(sf.LibsndfileError):
         runner.export_shard((path, clips, 0.4, 25))
     assert not list(clips.rglob("*.flac"))
+
+
+@pytest.mark.parametrize(
+    "text,prompt",
+    [
+        ("<|1.00|> word<|1.00|>", False),
+        ("<|1.00|> word<|2.00|><|3.00|>", True),
+        ("<|0.01|> word<|1.00|>", False),
+        ("<|0.00|> word<|31.00|>", False),
+        ("<|1.00|> word<|3.00|><|2.00|> next<|4.00|>", False),
+    ],
+)
+def test_export_validation_rejects_invalid_labels(text, prompt):
+    with pytest.raises(ValueError):
+        runner.validate_labels(text, prompt=prompt)
+
+
+def test_export_validation_distinguishes_partial_targets_from_completed_prompts():
+    target = "<|0.00|> word<|1.00|><|29.00|>"
+    assert runner.validate_labels(target)["cues"] == 1
+    assert runner.validate_labels("", prompt=True) == {}
+    # Prompt context from earlier windows may restart its relative clock.
+    assert (
+        runner.validate_labels("<|29.00|> previous<|30.00|><|0.00|> next<|1.00|>", prompt=True)[
+            "cues"
+        ]
+        == 2
+    )
+
+
+def test_export_checks_every_flac_header_and_sliced_array_offsets():
+    good = {"bytes": audio_bytes(1), "path": None}
+    bad = {"bytes": b"not FLAC", "path": "external.wav"}
+    values = pa.array([good, good, bad])
+    runner.validate_flac_headers(values.slice(1, 1))
+    with pytest.raises(ValueError, match="embedded FLAC"):
+        runner.validate_flac_headers(values.slice(1, 2))
+
+
+def test_batch_counts_account_for_skips_and_merges_before_acceptance():
+    counts = dict(
+        input_clips=10,
+        failed_clips=0,
+        skipped_empty_text=1,
+        skipped_placeholder_text=1,
+        skipped_no_speech=2,
+        skipped_unlabelled_speech=1,
+        kept_speech_clips=5,
+        kept_empty_clips=0,
+        merged_captions=1,
+        output_cues=4,
+    )
+    runner.validate_counts({"exported_clips": 10}, counts, {"input_cues": 4})
+    for corrupted in (
+        {**counts, "skipped_no_speech": 1},
+        {**counts, "merged_captions": 0},
+        {**counts, "output_cues": 3},
+    ):
+        with pytest.raises(RuntimeError, match="do not reconcile"):
+            runner.validate_counts({"exported_clips": 10}, corrupted, {"input_cues": 4})

@@ -24,8 +24,12 @@ def read_audio(
     if audio_segment is None:
         audio_segment = AudioSegment.from_file(path)
 
-    if resample_rate is not None:
-        audio_segment = audio_segment.set_frame_rate(resample_rate)
+    if resample_rate is not None and audio_segment.frame_rate != resample_rate:
+        # set_frame_rate uses audioop.ratecv, which aliases frequencies above
+        # the new Nyquist limit. Export parameters actually reach FFmpeg's
+        # output resampler; from_file(parameters=...) does not do this for WAV.
+        with audio_segment.export(format="wav", parameters=["-ar", str(resample_rate)]) as stream:
+            audio_segment = AudioSegment.from_wav(stream)
 
     if normalize:
         audio_segment = effects.normalize(audio_segment)
