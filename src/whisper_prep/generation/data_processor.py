@@ -20,6 +20,7 @@ from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE, get_tokenizer
 from whisper.utils import format_timestamp
 
 from whisper_prep.audio.vad import silero_speech_ratio
+from whisper_prep.config import DEFAULT_AUDIO_FORMAT
 from whisper_prep.generation.typing import PromptNode, Record, Utterance
 from whisper_prep.subtitling.parse import milliseconds, read_cues
 from whisper_prep.subtitling.srt import can_trim_overlap
@@ -82,7 +83,7 @@ class DataProcessor:
         n_jobs: int = 1,
         seed: int = 42,
         max_error_rate: float = 0.0,
-        audio_format: str = "mp3",
+        audio_format: str = DEFAULT_AUDIO_FORMAT,
         vad_backend: str = "torch",
     ) -> None:
         self.with_timestamps = with_timestamps

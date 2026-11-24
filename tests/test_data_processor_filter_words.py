@@ -52,8 +52,8 @@ class TestDataProcessorFilterWords(unittest.TestCase):
 
             records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(records), 2)
-            self.assertEqual(Path(records[0]["audio_path"]).name, "0.mp3")
-            self.assertEqual(Path(records[1]["audio_path"]).name, "28190.mp3")
+            self.assertEqual(Path(records[0]["audio_path"]).name, "0.flac")
+            self.assertEqual(Path(records[1]["audio_path"]).name, "28190.flac")
             self.assertIn("Hello until just before the window end", records[0]["text"])
             self.assertNotIn("Next speech belongs", records[0]["text"])
             self.assertIn("Next speech belongs", records[1]["text"])
@@ -119,7 +119,7 @@ class TestDataProcessorFilterWords(unittest.TestCase):
             self.assertTrue(all("SECRET" not in record["text"] for record in records))
             self.assertEqual(
                 [Path(record["audio_path"]).name for record in records],
-                ["0.mp3", "20000.mp3"],
+                ["0.flac", "20000.flac"],
             )
 
             first_audio, first_rate = torchaudio.load(output.parent / records[0]["audio_path"])
@@ -128,7 +128,7 @@ class TestDataProcessorFilterWords(unittest.TestCase):
             self.assertEqual(second_rate, SAMPLE_RATE)
             self.assertEqual(round(first_audio.size(1) * 1000 / first_rate), 10000)
             self.assertEqual(round(second_audio.size(1) * 1000 / second_rate), 5000)
-            self.assertFalse((dump_dir / "sample" / "10000.mp3").exists())
+            self.assertFalse((dump_dir / "sample" / "10000.flac").exists())
 
     def test_repeated_hallucination_blocks_audio_not_empty_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -185,10 +185,10 @@ class TestDataProcessorFilterWords(unittest.TestCase):
             records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
             names = [Path(record["audio_path"]).name for record in records]
 
-            self.assertIn("0.mp3", names)
-            self.assertIn("1000.mp3", names)  # true silence before hallucination
-            self.assertIn("30000.mp3", names)
-            self.assertNotIn("10000.mp3", names)
+            self.assertIn("0.flac", names)
+            self.assertIn("1000.flac", names)  # true silence before hallucination
+            self.assertIn("30000.flac", names)
+            self.assertNotIn("10000.flac", names)
             self.assertTrue(all("Repeated credit" not in record["text"] for record in records))
 
             hallucination_report = root / "filtered_repeated_hallucination_segments.tsv"
@@ -250,14 +250,14 @@ class TestDataProcessorFilterWords(unittest.TestCase):
             self.assertTrue(all("SECRET" not in record["text"] for record in records))
             self.assertEqual(
                 [Path(record["audio_path"]).name for record in records],
-                ["0.mp3", "12000.mp3"],
+                ["0.flac", "12000.flac"],
             )
 
             first_audio, first_rate = torchaudio.load(output.parent / records[0]["audio_path"])
             second_audio, second_rate = torchaudio.load(output.parent / records[1]["audio_path"])
             self.assertEqual(round(first_audio.size(1) * 1000 / first_rate), 6000)
             self.assertEqual(round(second_audio.size(1) * 1000 / second_rate), 6000)
-            self.assertFalse((dump_dir / "sample" / "6000.mp3").exists())
+            self.assertFalse((dump_dir / "sample" / "6000.flac").exists())
 
     def test_filter_words_cut_real_fixture_audio_lengths_and_json_output(self):
         fixture_id = "filter_words_fixture"
@@ -297,7 +297,7 @@ class TestDataProcessorFilterWords(unittest.TestCase):
                 self.assertNotIn("TV-Zuschauer", record["text"])
                 self.assertNotIn("pragmatisch", record["text"])
 
-            self.assertTrue(any(Path(record["audio_path"]).name != "0.mp3" for record in records))
+            self.assertTrue(any(Path(record["audio_path"]).name != "0.flac" for record in records))
 
             for record in records:
                 audio, sample_rate = torchaudio.load(output.parent / record["audio_path"])
@@ -313,6 +313,6 @@ class TestDataProcessorFilterWords(unittest.TestCase):
                         f"{blocked_start}-{blocked_end}",
                     )
 
-            emitted_names = {path.name for path in (dump_dir / fixture_id).glob("*.mp3")}
+            emitted_names = {path.name for path in (dump_dir / fixture_id).glob("*.flac")}
             for blocked_start, _ in blocked_intervals:
-                self.assertNotIn(f"{blocked_start}.mp3", emitted_names)
+                self.assertNotIn(f"{blocked_start}.flac", emitted_names)

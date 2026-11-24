@@ -3,6 +3,8 @@
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
+DEFAULT_AUDIO_FORMAT = "flac"
+
 
 @dataclass
 class PipelineConfig:
@@ -27,7 +29,7 @@ class PipelineConfig:
     vad_chance: float = 1.0
     vad_backend: str = "torch"
     keep_empty_chance: float = 0.0
-    audio_format: str = "mp3"
+    audio_format: str = DEFAULT_AUDIO_FORMAT
     seed: int = 42
     n_jobs: int = 1
     transcripts_tsv_n_jobs: int | None = None

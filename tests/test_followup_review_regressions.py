@@ -394,7 +394,7 @@ def test_ambiguous_reversed_cue_is_a_file_error_before_audio_is_written(tmp_path
     errors = json.loads((tmp_path / "data.errors.json").read_text())
     assert summary["failed_files"] == 1 and summary["output_records"] == 0
     assert "Ambiguous reversed" in errors[0]["message"]
-    assert not list((tmp_path / "dump").rglob("*.mp3"))
+    assert not any(path.is_file() for path in (tmp_path / "dump").rglob("*"))
 
 
 @pytest.mark.parametrize("word", ["0.0", "2.5", "|>"])

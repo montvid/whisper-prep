@@ -29,9 +29,9 @@ filtering loads fastText on first use and may download its language model.
 
 For faster CPU VAD, install `pip install -e '.[onnx]'` and set
 `vad_backend: onnx-sequence`. Silero 6.2.3 processes frames in blocks with ONNX
-Runtime; `torch` remains the default backend. Set `audio_format: flac` for
-lossless 16-bit fused recordings and final segments, including the embedded
-audio in the exported Hugging Face dataset.
+Runtime. The default VAD backend is `torch`. Fused recordings, final segments,
+and embedded Hugging Face audio default to lossless 16-bit FLAC. Set
+`audio_format: mp3` or `audio_format: wav` to select another format.
 
 For a bounded, resumable rebuild of local LIEPA-3 Parquet files, see
 [the LIEPA-3 runbook](docs/liepa3.md).

@@ -203,7 +203,7 @@ def test_duplicate_ids_rejected_before_writing_audio(tmp_path):
     )
     with pytest.raises(ValueError, match="Duplicate output id"):
         processor.run()
-    assert not list((tmp_path / "dump").rglob("*.mp3"))
+    assert not any(path.is_file() for path in (tmp_path / "dump").rglob("*"))
 
 
 def test_tsv_paths_ids_and_languages_are_validated(tmp_path, monkeypatch):
@@ -550,7 +550,7 @@ def test_empty_filtered_export_and_orphan_cleanup(tmp_path):
     result = main({**config, "min_text_words": 999, "drop_empty_text": True})
     assert len(result["train"]) == 0
     folder = tmp_path / "output/test/train/created_dataset"
-    assert not list((folder / "dump").rglob("*.mp3"))
+    assert not any(path.is_file() for path in (folder / "dump").rglob("*"))
     assert DataProcessor.read_records(folder / "data.ljson") == []
     assert len(pandas_to_hf_dataset(ljson_to_pandas(folder / "data.ljson"))["train"]) == 0
     from datasets import Audio, load_from_disk
@@ -700,7 +700,7 @@ def test_folder_ignores_metadata_and_rejects_colliding_stems(tmp_path):
 def test_portable_metadata_and_silence_cleanup(tmp_path):
     root = tmp_path / "original"
     _, records = process(root, [], 95, keep_empty_chance=1, subsampling_factor_for_silence=2)
-    assert len(records) == len(list((root / "dump").rglob("*.mp3"))) == 2
+    assert len(records) == len(list((root / "dump").rglob("*.flac"))) == 2
     destination = tmp_path / "moved"
     root.rename(destination)
     assert all(

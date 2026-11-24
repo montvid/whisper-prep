@@ -82,6 +82,7 @@ def test_empty_segment_vad_advances_after_rejecting_speechy_gap(tmp_path):
         output=str(tmp_path / "data.ljson"),
         dump_dir=str(tmp_path / "dump"),
         keep_empty_chance=1.0,
+        audio_format="mp3",
         validate_empty_with_vad=True,
         empty_vad_max_speech_ratio=0.06,
     )
@@ -126,7 +127,7 @@ def test_long_real_silence_is_split_and_kept_with_empty_vad(tmp_path):
     ]
     names = [Path(record["audio_path"]).name for record in records]
 
-    assert names == ["0.mp3", "30000.mp3", "60000.mp3"]
+    assert names == ["0.flac", "30000.flac", "60000.flac"]
     assert all(record["text"] == "" for record in records)
     assert all((tmp_path / record["audio_path"]).exists() for record in records)
 

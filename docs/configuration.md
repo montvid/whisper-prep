@@ -39,7 +39,7 @@ These options affect the sentence route only. Probabilities must be in [0, 1].
 | `overlap_chance` | `0.5` | Probability of overlapping clips. |
 | `max_overlap_chance` | `0.2` | Probability of choosing the maximum allowed overlap. |
 | `max_overlap_duration` | `0.2` | Nonnegative seconds of speech overlap beyond detected silence. |
-| `audio_format` | `mp3` | Format of both fused recordings and final training segments: `mp3`, `wav`, or `flac`. FLAC/WAV segments use 16-bit PCM. Applies to subtitle inputs too. |
+| `audio_format` | `flac` | Format of fused recordings and final training segments. Supports `flac`, `wav`, and `mp3`. FLAC/WAV segments use 16-bit PCM. Applies to subtitle inputs too. |
 
 ## Segmentation, normalization and filtering
 

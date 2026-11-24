@@ -104,11 +104,11 @@ filter_words: ["[MUSIC]", "[APPLAUSE]", "[SOUND EFFECTS]"]
 #   │   ├── data.ljson                 (processed records)
 #   │   └── dump/
 #   │       ├── audio_001/
-#   │       │   ├── 0.mp3              (segment 0-30s)
-#   │       │   ├── 30000.mp3          (segment 30-60s)
+#   │       │   ├── 0.flac             (segment 0-30s)
+#   │       │   ├── 30000.flac         (segment 30-60s)
 #   │       │   └── ...
 #   │       └── audio_002/
-#   │           ├── 0.mp3
+#   │           ├── 0.flac
 #   │           └── ...
 #   ├── hf/                            (HuggingFace format)
 #   ├── bad_examples.tsv               (filtered problematic samples)

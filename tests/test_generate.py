@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import soundfile as sf
 from datasets import load_from_disk
 
 from whisper_prep import main
@@ -30,16 +31,27 @@ def test_generate_data(tmp_path):
         dump_dir=direct / "dump",
     )
     processor.run()
-    assert DataProcessor.read_records(direct / "data.ljson")
-    for split in ("train", "val"):
+    records = DataProcessor.read_records(direct / "data.ljson")
+    assert records
+    for path in [*(direct / "audios").iterdir(), *(Path(record.audio_path) for record in records)]:
+        assert path.suffix == ".flac" and sf.info(path).subtype == "PCM_16"
+
+    for split, options in [("train", {}), ("val", {"audio_format": "mp3"})]:
         main(
             {
                 **inputs,
+                **options,
                 "out_folder_base": str(tmp_path),
                 "dataset_name": "corpus",
                 "split_name": split,
             }
         )
-        dataset = load_from_disk(tmp_path / "corpus" / split / "hf")[split]
+        folder = tmp_path / "corpus" / split
+        dataset = load_from_disk(folder / "hf")[split]
         assert len(dataset) > 0
         assert {"audio", "text", "language", "prompt"}.issubset(dataset.column_names)
+        extension = ".flac" if split == "train" else ".mp3"
+        assert {path.suffix for path in (folder / "audios").iterdir()} == {extension}
+        assert {path.suffix for path in (folder / "created_dataset/dump").glob("*/*")} == {
+            extension
+        }

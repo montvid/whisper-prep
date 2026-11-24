@@ -83,8 +83,8 @@ def _freesound_paths(n: int = 5) -> list[Path]:
 def _prepare_examples(
     audio_paths: list[Path],
     directory: Path,
-    expected_segments: int,
-    rejected_sources: set[str] | None = None,
+    expected_windows: set[tuple[str, int]],
+    audio_format: str = "flac",
 ) -> list[dict]:
     from datasets import Audio, load_from_disk
 
@@ -124,15 +124,16 @@ def _prepare_examples(
         keep_empty_chance=1.0,
         validate_empty_with_vad=True,
         empty_vad_max_speech_ratio=0.0,
+        audio_format=audio_format,
         n_jobs=1,
     ).run()
 
     records = ljson_to_pandas(output)
     # Check the retained output, including expected VAD rejections. Empty
     # or partially processed batches must not pass the assertions below.
-    assert len(records) == expected_segments
-    expected_sources = {path.stem for path in audio_paths} - (rejected_sources or set())
-    assert {Path(path).parent.name for path in records["audio"]} == expected_sources
+    assert len(records) == len(expected_windows)
+    paths = [Path(value) for value in records["audio"]]
+    assert {(path.parent.name, int(path.stem)) for path in paths} == expected_windows
 
     dataset_dir = directory / "hf"
     pandas_to_hf_dataset(records).save_to_disk(dataset_dir)
@@ -146,7 +147,7 @@ def _prepare_examples(
         samples, sample_rate = sf.read(source, dtype="float32")
         example["audio"] = {"array": samples, "sampling_rate": sample_rate}
         examples.append(example)
-    assert len(examples) == expected_segments
+    assert len(examples) == len(expected_windows)
     return examples
 
 
@@ -159,7 +160,8 @@ class TestUrbansoundHub:
     @pytest.fixture(scope="class")
     def examples(self, tmp_path_factory):
         directory = tmp_path_factory.mktemp("urbansound-hub")
-        return _prepare_examples(_urbansound_paths(directory), directory, expected_segments=10)
+        paths = _urbansound_paths(directory)
+        return _prepare_examples(paths, directory, {(path.stem, 0) for path in paths})
 
     def test_has_expected_columns(self, examples):
         required = {"audio", "text", "language", "prompt"}
@@ -206,16 +208,16 @@ class TestUrbansoundHub:
 class TestFreeSoundsHub:
     @pytest.fixture(scope="class")
     def examples(self, tmp_path_factory):
-        directory = tmp_path_factory.mktemp("freesounds-hub")
-        # The two segments from 0001 trigger speech detection and must not
-        # become empty-transcript examples. The other four clips yield six
-        # segments, including three from the 71-second recording 0002.
-        return _prepare_examples(
-            _freesound_paths(),
-            directory,
-            expected_segments=6,
-            rejected_sources={"noise-free-sound-0001"},
-        )
+        paths = _freesound_paths()
+        # The window at 30 s in 0001 has zero detected speech in the source PCM
+        # and its lossless FLAC. MP3 encoding crosses the VAD threshold.
+        common = {(paths[i].stem, 0) for i in (0, 2, 3, 4)}
+        common.update({(paths[2].stem, 30000), (paths[2].stem, 60000)})
+        examples = []
+        for fmt, windows in [("flac", common | {(paths[1].stem, 30000)}), ("mp3", common)]:
+            directory = tmp_path_factory.mktemp(f"freesounds-hub-{fmt}")
+            examples.extend(_prepare_examples(paths, directory, windows, fmt))
+        return examples
 
     def test_has_expected_columns(self, examples):
         required = {"audio", "text", "language", "prompt"}

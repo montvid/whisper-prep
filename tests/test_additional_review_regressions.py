@@ -272,7 +272,7 @@ def test_normalization_honors_allowed_file_error_rate(tmp_path, normalize, allow
     assert errors[0]["transcript_path"] == str(missing)
     if normalize:
         assert errors[0]["stage"] == "normalization"
-    assert not list((created / "dump/missing").glob("*.mp3"))
+    assert not any(path.is_file() for path in (created / "dump/missing").glob("*"))
 
 
 def test_all_normalization_failures_can_export_an_empty_dataset(tmp_path):
@@ -318,6 +318,6 @@ def test_malformed_vtt_cannot_export_real_speech_as_silence(tmp_path):
         main(config)
     created = tmp_path / "output/review/train/created_dataset"
     assert not (created / "data.ljson").read_text()
-    assert not list((created / "dump").rglob("*.mp3"))
+    assert not any(path.is_file() for path in (created / "dump").rglob("*"))
     summary = json.loads((created / "data.summary.json").read_text())
     assert summary["failed_files"] == 1

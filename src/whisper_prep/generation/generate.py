@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from whisper_prep.audio.io import read_audio, save_audio_segment
 from whisper_prep.audio.vad import silero_vad_collector
+from whisper_prep.config import DEFAULT_AUDIO_FORMAT
 from whisper_prep.dataset.convert import combine_tsvs_to_dataframe
 from whisper_prep.generation.text_normalizer import normalize_text as normalize_text_
 from whisper_prep.subtitling.srt import Caption, generate_srt
@@ -83,7 +84,7 @@ def _generate(
     max_overlap_duration,
     vad_chance,
     keep_empty_chance,
-    audio_format="mp3",
+    audio_format=DEFAULT_AUDIO_FORMAT,
     seed=42,
     file_name="00000000",
     vad_backend="torch",
@@ -205,7 +206,7 @@ def generate_fold(
     max_overlap_duration=0.2,
     vad_chance=1.0,
     keep_empty_chance=0.0,
-    audio_format="mp3",
+    audio_format=DEFAULT_AUDIO_FORMAT,
     n_jobs=4,
     seed=42,
     tsv_quoting="csv",
