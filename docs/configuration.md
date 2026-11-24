@@ -91,6 +91,10 @@ exception type, `data.errors.json` and `data.summary.json` totals.
 
 Malformed subtitle timing lines and untimed cue blocks are file errors, not
 empty transcripts. Valid empty SRTs and VTT headers/metadata remain supported.
+Convert rolling WebVTT captions to non-rolling cues before preparation. Preflight
+rejects a repeated display line when adjacent cues also contain a short transition
+or word timings on the new line. Separate identified WebVTT cues with an empty
+line so the identifier cannot become training text.
 Language-model initialization, checksum and prediction errors stop filtering
 instead of silently accepting the affected records.
 

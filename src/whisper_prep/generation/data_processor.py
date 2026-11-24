@@ -662,7 +662,8 @@ class DataProcessor:
         dump_dir = Path(self.dump_dir) / sanitize_example_id(speech_id or audio_path.stem)
         dump_dir.mkdir(parents=True, exist_ok=True)
         audio_duration_ms = int(audio.size(0) * 1000 / SAMPLE_RATE)
-        blocked = list(blocked_intervals or [])
+        # Filter reports retain source timestamps, including reversed cue boundaries.
+        blocked = [(min(start, end), max(start, end)) for start, end in blocked_intervals or []]
         prepared = []
         for cue in sorted(utterances, key=lambda u: u.start):
             cue = Utterance(cue.text, cue.start, cue.end)

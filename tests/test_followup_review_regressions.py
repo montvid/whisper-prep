@@ -1,4 +1,4 @@
-"""Observable contracts for N1–N14 in the follow-up review."""
+"""Regression tests for the follow-up reviews."""
 
 import json
 import re
@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from tests.test_review_regressions import process, sentence_tsv, subtitles, wav
+from tests.test_review_regressions import mapping, process, sentence_tsv, subtitles, wav
 from whisper_prep import main
 from whisper_prep.audio.io import read_audio
 from whisper_prep.generation.data_processor import DataProcessor
@@ -47,6 +47,36 @@ def test_fragment_cleanup_only_changes_adjacent_comma_space():
         drop_text_fragments("Hallo [Musik] , comment ça va ?", ["[Musik]"])
         == "Hallo, comment ça va ?"
     )
+
+
+@pytest.mark.parametrize("punctuation", ["?", "!", ":", ";"])
+def test_glued_fragment_preserves_the_original_punctuation_boundary(punctuation):
+    fragment = "[Musik]"
+    assert drop_text_fragments(f"Was ist das [MUSIK]{punctuation}", [fragment]) == (
+        f"Was ist das{punctuation}"
+    )
+    spaced = f"Ça va [Musik] {punctuation} Et toi ?"
+    assert drop_text_fragments(spaced, [fragment]) == f"Ça va {punctuation} Et toi ?"
+
+
+def test_converted_subtitle_html_preserves_word_boundaries_and_literal_text(tmp_path):
+    path = subtitles(
+        tmp_path / "converted.srt",
+        [
+            (0, 1000, "Line one<BR/>line two<br>three"),
+            (
+                1000,
+                2000,
+                '<div><span style="color:#ff0" title="x > y">Ge<em>lb</em></span></div><p>und <s>weg</s></p>',
+            ),
+            (2000, 3000, "<strong>5 < 6</strong> und 7 > 3, <smile> &lt;span&gt;"),
+        ],
+    )
+    assert [cue.text for cue in read_cues(path)] == [
+        "Line one line two three",
+        "Gelb und weg",
+        "5 < 6 und 7 > 3, <smile> <span>",
+    ]
 
 
 @pytest.mark.parametrize("text", ["5 < 6 und 7 > 3", "Use <placeholder> in this sentence"])
@@ -115,6 +145,25 @@ def test_rounding_half_steps_does_not_erase_a_full_timestamp_tick(tmp_path):
     assert all(end > start for start, end in zip(times[::2], times[1::2]))
 
 
+def test_subtick_cues_are_reported_and_a_full_tick_survives(tmp_path):
+    processor, records = process(
+        tmp_path,
+        [(100, 101, "One"), (200, 219, "Nineteen"), (300, 320, "Twenty")],
+        1,
+        audio_format="flac",
+    )
+    assert processor.stats["dropped_cue_timestamp_resolution"] == 2
+    assert [(r["start_ms"], r["end_ms"]) for r in processor.filtered_segment_records] == [
+        (100, 101),
+        (200, 219),
+    ]
+    assert len(records) == 1 and "Twenty" in records[0].text
+    assert "One" not in records[0].text and "Nineteen" not in records[0].text
+    assert int(Path(records[0].audio_path).stem) == 219
+    start, end = map(float, TIMES.findall(records[0].text))
+    assert end - start == pytest.approx(0.02)
+
+
 def folder_config(root, source, **options):
     return dict(
         out_folder_base=str(root / "output"),
@@ -144,6 +193,33 @@ def test_subtitle_preflight_fails_before_encoding_any_good_file(tmp_path, broken
         (tmp_path / "output/case/train/created_dataset/data.summary.json").read_text()
     )
     assert summary["failed_files"] == 1 and summary["preflight_skipped_files"] == 1
+
+
+def test_missing_mapped_audio_fails_preflight_before_encoding_other_files(tmp_path):
+    wav(tmp_path / "good.wav", 1)
+    subtitles(tmp_path / "words.srt", [(0, 1000, "Spoken words")])
+    tsv = mapping(
+        tmp_path / "inputs.tsv",
+        [
+            {"id": name, "audio_path": f"{name}.wav", "srt_path": "words.srt", "language": "en"}
+            for name in ("good", "missing")
+        ],
+    )
+    processor = DataProcessor(
+        "",
+        "",
+        transcripts_tsv=tsv,
+        output=tmp_path / "data.ljson",
+        dump_dir=tmp_path / "dump",
+        audio_format="flac",
+    )
+    with pytest.raises(RuntimeError, match="1/2 files during preflight"):
+        processor.run()
+    (error,) = json.loads((tmp_path / "data.errors.json").read_text())
+    assert error["stage"] == "preflight" and error["type"] == "FileNotFoundError"
+    assert Path(error["message"]).name == "missing.wav"
+    assert processor.stats["preflight_skipped_files"] == 1
+    assert not list((tmp_path / "dump").rglob("*.flac"))
 
 
 def test_language_model_is_checked_before_audio_processing(tmp_path, monkeypatch):
@@ -217,6 +293,7 @@ def test_unlabelled_speech_is_never_kept_as_empty_audio(tmp_path, monkeypatch, v
         [
             {"path": speech, "sentence": "Spoken text"},
             {"path": speech, "sentence": ""},
+            {"path": speech, "sentence": "."},
             {"path": silence, "sentence": ""},
         ],
         audios,
@@ -229,7 +306,8 @@ def test_unlabelled_speech_is_never_kept_as_empty_audio(tmp_path, monkeypatch, v
         audio_format="flac",
         stats=counts,
     )
-    assert counts["input_clips"] == 3 and counts["skipped_unlabelled_speech"] == 1
+    assert counts["input_clips"] == 4 and counts["skipped_unlabelled_speech"] == 1
+    assert counts["skipped_placeholder_text"] == 1
     assert counts["kept_speech_clips"] == counts["kept_empty_clips"] == 1
     assert sf.info(audios / "00000000.flac").duration == 2
     assert [cue.text for cue in read_cues(transcripts / "00000000.srt")] == ["Spoken text"]
@@ -241,6 +319,57 @@ def test_webvtt_space_only_payload_line_is_not_a_separator(tmp_path):
         "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n \nSpoken words\n\n00:00:03.000 --> 00:00:04.000\nOther words\n"
     )
     assert [cue.text for cue in read_cues(path)] == ["Spoken words", "Other words"]
+
+
+@pytest.mark.parametrize("bridge,word_timing", [(True, True), (True, False), (False, True)])
+def test_rolling_webvtt_is_rejected_in_preflight(tmp_path, bridge, word_timing):
+    source = tmp_path / "source"
+    wav(source / "roll.wav", 5)
+    transition = "00:02.230 --> 00:02.240\nhello and welcome\n \n\n" if bridge else ""
+    start = "00:02.240" if bridge else "00:02.230"
+    previous = "hello<00:00:00.320><c> and welcome</c>" if word_timing else "hello and welcome"
+    current = "to<00:00:03.000><c> the channel</c>" if word_timing else "to the channel"
+    path = source / "roll.vtt"
+    contents = (
+        f"WEBVTT\n\nNOTE generated captions\nin English\n\n00:00.080 --> 00:02.230\n \n{previous}\n\n{transition}"
+        f"{start} --> 00:04.470 align:start position:0%\nhello and welcome\n{current}\n\n"
+        "00:04.470 --> 00:04.480\nto the channel\n \n"
+    )
+    path.write_text(contents)
+    with pytest.raises(RuntimeError, match="during preflight"):
+        main(folder_config(tmp_path, source))
+    (error,) = json.loads(
+        (tmp_path / "output/case/train/created_dataset/data.errors.json").read_text()
+    )
+    line = contents[: contents.index(f"{start} --> 00:04.470")].count("\n") + 1
+    assert "rolling WebVTT" in error["message"] and f"{path}:{line}" in error["message"]
+    assert not list((tmp_path / "output").rglob("*.flac"))
+
+
+def test_ordinary_repetition_and_word_timed_webvtt_keep_their_spoken_text(tmp_path):
+    path = tmp_path / "dialogue.vtt"
+    path.write_text(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nAgain\n\n"
+        "00:01.000 --> 00:02.000\nAgain\n \nPlease\n\n"
+        "00:02.000 --> 00:03.000\n<00:02.000>Please\nSay<00:02.500> it\n\n"
+        "00:05.000 --> 00:06.000\nSay it\nOnce<00:05.500> more\n"
+    )
+    assert [cue.text for cue in read_cues(path)] == [
+        "Again",
+        "Again Please",
+        "Please Say it",
+        "Say it Once more",
+    ]
+
+
+def test_whitespace_only_webvtt_separator_cannot_leak_a_cue_identifier(tmp_path):
+    path = tmp_path / "ids.vtt"
+    path.write_text(
+        "WEBVTT\n\nfirst-cue\n00:00.000 --> 00:01.000\nHello\n \nsecond-cue\n"
+        "00:01.000 --> 00:02.000\nGoodbye\n"
+    )
+    with pytest.raises(ValueError, match="empty line"):
+        read_cues(path)
 
 
 def test_subtitle_timing_arrow_accepts_missing_spaces(tmp_path):
@@ -330,6 +459,29 @@ def test_overlapping_filtered_cue_excludes_the_whole_affected_speech(tmp_path):
         assert end <= 2001 or start >= 5000
 
 
+def test_reversed_filtered_cue_audio_is_excluded_from_the_saved_flacs(tmp_path):
+    processor, records = process(
+        tmp_path,
+        [(1000, 2000, "Good one"), (20500, 20000, "FILTERME words"), (24000, 25000, "Good two")],
+        60,
+        filter_segment_words=["FILTERME"],
+        audio_format="flac",
+    )
+    (dropped,) = processor.filtered_segment_records
+    assert (dropped["matched_word"], dropped["start_ms"], dropped["end_ms"]) == (
+        "FILTERME",
+        20500,
+        20000,
+    )
+    spans = []
+    for record in records:
+        start = int(Path(record.audio_path).stem)
+        info = sf.info(record.audio_path)
+        spans.append((start, start + info.frames * 1000 // info.samplerate))
+    assert spans == [(0, 20000), (20500, 50500)]
+    assert "Good one" in records[0].text and "Good two" in records[1].text
+
+
 def test_defensive_invalid_window_resumes_at_partial_cue_and_clears_prompt(tmp_path, monkeypatch):
     original = DataProcessor._is_valid_utterances
 
@@ -359,14 +511,15 @@ def test_coarse_grid_falls_back_to_native_ticks_instead_of_erasing_speech(tmp_pa
     assert records[0].text == "<|1.00|> Short<|2.00|><|3.00|> Next<|4.00|>"
 
 
-def test_unicode_named_recordings_produce_distinct_usable_output(tmp_path):
+def test_distinct_recording_names_preserve_unicode_and_literal_underscores(tmp_path):
     source = tmp_path / "source"
-    for name in ("pokalbis_ą", "pokalbis_č", "कला", "कली"):
+    names = ("pokalbis_ą", "pokalbis_č", "कला", "कली", "rec_01", "rec__01")
+    for name in names:
         wav(source / (name + ".wav"), 1)
         subtitles(source / (name + ".srt"), [(0, 1000, name)])
     dataset = main(folder_config(tmp_path, source))
-    assert len(dataset["train"]) == 4
-    assert len(list((tmp_path / "output").rglob("*.flac"))) == 4
+    assert len(dataset["train"]) == len(names)
+    assert {p.parent.name for p in (tmp_path / "output").rglob("*.flac")} == set(names)
 
 
 def test_fusion_collects_multiple_decode_failures_in_one_run(tmp_path):

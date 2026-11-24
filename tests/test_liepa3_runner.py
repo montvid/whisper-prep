@@ -54,9 +54,11 @@ def test_incomplete_corpus_cannot_silently_change_evaluation_split():
         runner.held_out(list(range(12)), "read")
 
 
-def audio_bytes(seconds):
+def audio_bytes(seconds, *, rate=16000, channels=1, subtype="PCM_16"):
     stream = io.BytesIO()
-    sf.write(stream, np.zeros(round(seconds * 16000)), 16000, format="FLAC", subtype="PCM_16")
+    sf.write(
+        stream, np.zeros((round(seconds * rate), channels)), rate, format="FLAC", subtype=subtype
+    )
     return stream.getvalue()
 
 
@@ -142,6 +144,13 @@ def test_export_checks_every_flac_header_and_sliced_array_offsets():
         runner.validate_flac_headers(values.slice(1, 2))
 
 
+@pytest.mark.parametrize("settings", [{"rate": 8000}, {"channels": 2}, {"subtype": "PCM_24"}])
+def test_export_rejects_valid_flac_with_the_wrong_audio_format(settings):
+    values = pa.array([{"bytes": audio_bytes(1, **settings)}])
+    with pytest.raises(ValueError, match="mono 16 kHz PCM16 FLAC"):
+        runner.validate_flac_headers(values)
+
+
 def test_batch_counts_account_for_skips_and_merges_before_acceptance():
     counts = dict(
         input_clips=10,
@@ -156,6 +165,8 @@ def test_batch_counts_account_for_skips_and_merges_before_acceptance():
         output_cues=4,
     )
     runner.validate_counts({"exported_clips": 10}, counts, {"input_cues": 4})
+    with pytest.raises(RuntimeError, match="do not reconcile"):
+        runner.validate_counts({"exported_clips": 9}, counts, {"input_cues": 4})
     for corrupted in (
         {**counts, "skipped_no_speech": 1},
         {**counts, "merged_captions": 0},
