@@ -91,10 +91,19 @@ exception type, `data.errors.json` and `data.summary.json` totals.
 
 Malformed subtitle timing lines and untimed cue blocks are file errors, not
 empty transcripts. Valid empty SRTs and VTT headers/metadata remain supported.
-Convert rolling WebVTT captions to non-rolling cues before preparation. Preflight
-rejects a repeated display line when adjacent cues also contain a short transition
-or word timings on the new line. Separate identified WebVTT cues with an empty
-line so the identifier cannot become training text.
+Each SRT or WebVTT cue should contain the words spoken during its interval.
+Convert broadcast roll-up captions and accumulating dialogue to this form before
+preparation. Preflight reports the source file and line when successive displays
+carry forward one or more complete lines and add new text. It checks for two
+consecutive carry-forwards or a strict majority of all cue changes, allowing up
+to 100 ms between displays. In a two-cue file the single change can establish
+that majority. A short transition cue or inline word timings on the new text can
+also identify a single rolling update within 20 ms. A fresh word timing on a
+copied line counts as evidence that it was spoken again. For an ambiguous track,
+check the audio and put each spoken occurrence in its own cue.
+
+Separate identified WebVTT cues with an empty line so the identifier cannot
+become training text.
 Language-model initialization, checksum and prediction errors stop filtering
 instead of silently accepting the affected records.
 

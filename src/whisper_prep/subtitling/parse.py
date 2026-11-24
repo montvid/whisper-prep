@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 from whisper_prep.generation.typing import Utterance
-from whisper_prep.text import VTT_WORD_TIMESTAMP, clean_subtitle_markup
+from whisper_prep.text import VTT_WORD_TIMESTAMP, clean_subtitle_markup, render_subtitle_tags
 
 TIMESTAMP = r"(?:\d+:)?\d{2}:\d{2}[.,]\d{1,3}"
 TIMING_LINE = re.compile(rf"^\s*({TIMESTAMP})\s*-->\s*({TIMESTAMP})(?:\s+.*)?$")
@@ -33,16 +33,39 @@ def read_subtitle_text(path: str | Path) -> str:
         return raw.decode("cp1252")
 
 
-def _is_rolling_vtt(previous: Utterance, previous_tail: str, start: int, lines: list[str]) -> bool:
-    # A rolling cue displays the previous line above the newly spoken words.
-    # Corroborate the repeated line with a short transition cue or fresh word timings.
-    if len(lines) < 2 or abs(start - previous.end) > 20 or VTT_WORD_TIMESTAMP.search(lines[0]):
-        return False
-    transition = 0 < previous.end - previous.start < 20
-    if not transition and not any(VTT_WORD_TIMESTAMP.search(line) for line in lines[1:]):
-        return False
-    carried = clean_subtitle_markup(lines[0])
-    return bool(carried) and carried == clean_subtitle_markup(previous_tail)
+def _display_lines(body: list[str], cue_text: str) -> tuple[list[str], int | None]:
+    if len(body) == 1 and "<" not in body[0] and r"\N" not in body[0]:
+        return [cue_text], None  # A single line cannot carry text above a new line.
+    raw_lines = render_subtitle_tags("\n".join(body)).replace(r"\N", "\n").splitlines()
+    if len(raw_lines) < 2:
+        return [cue_text], None
+    lines = []
+    first_word_timing = None
+    for line in raw_lines:
+        if first_word_timing is None and VTT_WORD_TIMESTAMP.search(line):
+            first_word_timing = len(lines)
+        visible = clean_subtitle_markup(line)
+        if visible:
+            lines.append(visible)
+    return lines, first_word_timing
+
+
+def _carried_lines(previous: list[str], current: list[str]) -> int:
+    """Count complete trailing lines redisplayed above a new final line."""
+    if not previous or len(current) < 2 or current == previous:
+        return 0
+    for count in range(min(len(previous), len(current) - 1), 0, -1):
+        if previous[-1] == current[count - 1] and previous[-count:] == current[:count]:
+            return count if any(line != previous[-1] for line in current[count:]) else 0
+    return 0
+
+
+def _rolling_error(path, line: int, is_vtt: bool) -> ValueError:
+    kind = "WebVTT" if is_vtt else "SRT"
+    return ValueError(
+        f"Detected rolling {kind} captions in {path}:{line}. "
+        "Convert them to non-rolling subtitles before preparing this file."
+    )
 
 
 def read_cues(path: str | Path) -> list[Utterance]:
@@ -84,7 +107,8 @@ def read_cues(path: str | Path) -> list[Utterance]:
             # including cues whose blank separator is missing.
             raise ValueError(f"Invalid subtitle timing line in {path}:{index + 1}: {line!r}")
     cues = []
-    previous_tail = ""
+    previous_lines = []
+    carry_positions = []
     for position, (index, match) in enumerate(indices):
         stop = indices[position + 1][0] if position + 1 < len(indices) else len(lines)
         body = lines[index + 1 : stop]
@@ -110,18 +134,27 @@ def read_cues(path: str | Path) -> list[Utterance]:
                 )
         cue_text = clean_subtitle_markup(" ".join(body))
         if not cue_text or cue_text == ".":
-            previous_tail = ""
+            previous_lines = []
             continue
         cue = Utterance(cue_text, milliseconds(match[1]), milliseconds(match[2]))
-        if is_vtt:
-            lines_with_text = [line for line in body if line.strip()]
-            if previous_tail and _is_rolling_vtt(
-                cues[-1], previous_tail, cue.start, lines_with_text
-            ):
-                raise ValueError(
-                    f"Detected rolling WebVTT captions in {path}:{index + 1}. "
-                    "Convert them to non-rolling subtitles before preparing this file."
-                )
-            previous_tail = lines_with_text[-1]
+        display, first_timing = _display_lines(body, cue_text)
+        if previous_lines and len(display) > 1:
+            previous = cues[-1]
+            gap = abs(cue.start - previous.end)
+            # Allow a few video frames at a display change. A word timing on the
+            # supposedly carried text gives that line its own speech alignment.
+            carried = _carried_lines(previous_lines, display) if gap <= 100 else 0
+            if carried and (first_timing is None or first_timing >= carried):
+                transition = 0 < previous.end - previous.start < 20
+                word_timed = first_timing is not None and first_timing < len(display)
+                if gap <= 20 and (transition or word_timed):
+                    raise _rolling_error(path, index + 1, is_vtt)
+                if carry_positions and carry_positions[-1] == position - 1:
+                    raise _rolling_error(path, indices[carry_positions[-1]][0] + 1, is_vtt)
+                carry_positions.append(position)
+        previous_lines = display
         cues.append(cue)
+    # Dialogue may accumulate in separate pairs rather than in one continuous run.
+    if carry_positions and 2 * len(carry_positions) > len(cues) - 1:
+        raise _rolling_error(path, indices[carry_positions[0]][0] + 1, is_vtt)
     return cues

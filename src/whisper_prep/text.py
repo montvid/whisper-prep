@@ -38,10 +38,13 @@ def resolve_path(value, base: Path) -> Path:
     return path if path.is_absolute() else (base / path).resolve()
 
 
+def render_subtitle_tags(text: str) -> str:
+    """Remove known presentation tags, preserving display breaks and literal <words>."""
+    return _SUBTITLE_TAG.sub(lambda tag: "\n" if tag[1].lower() in {"br", "p", "div"} else "", text)
+
+
 def clean_subtitle_markup(text: str) -> str:
-    # Only subtitle markup is disposable. Comparisons and literal <words>
-    # can be spoken content, so arbitrary angle-bracketed text must survive.
-    text = _SUBTITLE_TAG.sub(lambda tag: " " if tag[1].lower() in {"br", "p", "div"} else "", text)
+    text = render_subtitle_tags(text)
     text = VTT_WORD_TIMESTAMP.sub("", text)
     text = re.sub(r"\s+</?(?:font|i|b|u)(?:\s[^>]*)?$", "", text, flags=re.I)
     text = re.sub(r"\{\\[^}]*\}", "", text)
